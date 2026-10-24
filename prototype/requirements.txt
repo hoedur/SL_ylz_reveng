@@ -1,0 +1,14 @@
+# otoscope prototype — pip requirements
+# Purpose: validation prototype for the reverse-engineered UDP video protocol
+# (BoliU/BL384). Install: python -m pip install -r requirements.txt
+#
+# Core runtime
+PyQt6==6.11.0            # GUI window: video stream + generic metadata panel
+
+# Test stack (process rule REQ-TEST-001/003: pytest suites in prototype/tests/)
+pytest==9.1.1
+pytest-qt==4.5.0
+
+# Used by tests only (PIL decode checks: REQ-BOL-006 artifact vector,
+# FakeDevice/UI tests crafting real 640x360 JPEGs); not imported by core modules
+pillow==13.0.0

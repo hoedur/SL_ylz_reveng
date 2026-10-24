@@ -1,0 +1,341 @@
+"""Multi-fragment reassembly tests for the BoliU/BL384 transport (REQ-BOL-005).
+
+Frames are hand-crafted from the REQ-BOL-004 byte layout (see
+``test_boliu_datagrams.py`` for the field map); REQ-BOL-005 adds:
+
+- reassembly keyed by ``(frame_id, size)``; frame ids 1 and 2 coexist,
+- completeness = first ``cnt`` indices collected,
+- pending keys > 16 -> oldest pruned with a ``frame_dropped`` event
+  (``fields={"pruned": True}``),
+- on completion: one ``frame_complete`` event (fields frame_id, size, cnt, w, h, q)
+  and one frame pushed to the queue = ``jhdr_Q100 (607 B) + concat(pages IN INDEX
+  ORDER) + FF D9`` (length 607 + size + 2).
+
+Frames use the spec's fake-device size 2100 -> cnt = 3 -> pages 1024/1024/52
+(spec §5); page payloads are deterministic tags, deliberately NOT JPEG-decodable.
+"""
+
+import socket
+import struct
+import time
+from pathlib import Path
+
+import pytest
+
+from otoscope_proto.device.boliu import BoliUTransport
+from otoscope_proto.jpeg_frames import jpeg_size
+from otoscope_proto.telemetry import TelemetryStore
+
+JHDR_PATH = Path(__file__).resolve().parents[2] / "analysis" / "artifacts" / "jhdr_Q100.bin"
+JHDR = JHDR_PATH.read_bytes()  # REQ-BOL-005/006: the 607 B reconstruction header
+
+SIZE = 2100  # spec §5 pressure-test size
+CNT = 3
+PAGES = [1024, 1024, SIZE - (CNT - 1) * 1024]  # 1024 / 1024 / 52
+W, H, Q = 640, 444, 77
+DEVICE_SRC_IP, DEVICE_SRC_PORT = "127.0.0.1", 1234
+
+
+def mkpage(tag: int, length: int) -> bytes:
+    return bytes((tag * 31 + 7 * i) % 251 for i in range(length))
+
+
+def fragment(frame_id, idx, cnt, size, page, *, w=W, h=H, q=Q, dup=0):
+    head = 67 if idx == 0 else 56
+    d = bytearray(head + len(page))
+    d[0] = 0x93
+    d[1] = 1
+    struct.pack_into("<H", d, 2, len(d))
+    d[4:8] = b"\x02\x02\x00\x01"
+    struct.pack_into("<I", d, 8, frame_id)
+    struct.pack_into("<I", d, 16, dup)
+    struct.pack_into("<I", d, 32, idx)
+    struct.pack_into("<I", d, 36, cnt)
+    struct.pack_into("<I", d, 40, size)
+    struct.pack_into("<H", d, 44, w)
+    struct.pack_into("<H", d, 46, h)
+    struct.pack_into("<H", d, 48, q)
+    d[head:] = page
+    return bytes(d)
+
+
+def frame_datagrams(frame_id, payload_tag, cnt=CNT, size=SIZE):
+    """All fragments of one frame, index order, with their page payloads."""
+    pages = [mkpage(payload_tag, ln) for ln in PAGES[:cnt]]
+    dgrams = [fragment(frame_id, i, cnt, size, pg) for i, pg in enumerate(pages)]
+    return dgrams, pages
+
+
+def reconstructed(pages):
+    # REQ-BOL-005 + REQ-BOL-006: jhdr + pages in index order + FF D9
+    return JHDR + b"".join(pages) + b"\xff\xd9"
+
+
+class Collector:
+    def __init__(self, store: TelemetryStore) -> None:
+        self.store = store
+        self.idx = 0
+        self.events = []
+
+    def pump(self):
+        evs, self.idx = self.store.get_since(self.idx)
+        self.events.extend(evs)
+        return evs
+
+    def wait_for(self, desc, pred, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while True:
+            self.pump()
+            for ev in self.events:
+                if pred(ev):
+                    return ev
+            if time.monotonic() >= deadline:
+                pytest.fail(f"timeout after {timeout:.1f}s waiting for {desc}")
+            time.sleep(0.02)
+
+    def wait_for_count(self, kind, n, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while len(self.by_kind(kind)) < n:
+            self.pump()
+            if time.monotonic() >= deadline:
+                pytest.fail(f"timeout after {timeout:.1f}s waiting for {n}x {kind}")
+            time.sleep(0.02)
+        self.pump()
+
+    def settle(self, seconds=0.3):
+        time.sleep(seconds)
+        self.pump()
+
+    def by_kind(self, kind):
+        return [e for e in self.events if e.kind == kind]
+
+
+class LoopbackHarness:
+    def __init__(self) -> None:
+        self.ping_sink = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.ping_sink.bind(("127.0.0.1", 0))
+        self.ping_port = self.ping_sink.getsockname()[1]
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.bind(("127.0.0.1", 0))
+            self.local_port = probe.getsockname()[1]
+        finally:
+            probe.close()
+        self.store = TelemetryStore("boliu")
+        self.transport = BoliUTransport(
+            "127.0.0.1", self.ping_port, self.store, local_port=self.local_port
+        )
+        self.col = Collector(self.store)
+        self.sender = None
+        self.transport.start()
+        self.col.wait_for("first ping event", lambda e: e.kind == "ping", timeout=5.0)
+        time.sleep(0.05)
+
+    def send(self, payload):
+        if self.sender is None:
+            self.sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sender.bind((DEVICE_SRC_IP, DEVICE_SRC_PORT))
+        self.sender.sendto(payload, ("127.0.0.1", self.local_port))
+
+    def pop_frames(self):
+        frames = []
+        while True:
+            f = self.store.pop_frame()  # () = none (REQ-TEL-002)
+            if not f:
+                return frames
+            frames.append(f)
+
+    def settle(self, seconds=0.3):
+        # Bounded wait (fixed ceiling, < 1 s) for late worker processing,
+        # then one drain of the event log — mirrors the datagrams-file helper.
+        time.sleep(seconds)
+        self.col.pump()
+
+    def assert_no_frames(self):
+        # The frame queue (not the event log) is the reassembly side effect;
+        # pop_frames() drains it fully and must find it empty.
+        assert self.pop_frames() == []
+
+    def wait_frames(self, count, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        frames = self.pop_frames()
+        while len(frames) < count:
+            self.col.pump()  # keep the collector warm, not required for the queue
+            if time.monotonic() >= deadline:
+                pytest.fail(f"timeout waiting for {count} frame(s); got {len(frames)}")
+            time.sleep(0.02)
+            frames += self.pop_frames()
+        return frames
+
+    def close(self):
+        self.transport.stop()
+        self.transport.stop()  # REQ-ARCH-004 idempotency
+        if self.sender is not None:
+            self.sender.close()
+        self.ping_sink.close()
+
+
+def assert_complete_fields(ev, frame_id):
+    # REQ-BOL-005: fields = {"frame_id","size","cnt","w","h","q"} (six fields;
+    # datagram_len == 0 per REQ-TEL-001, it is a synthesized logic event).
+    assert ev.fields["frame_id"] == frame_id
+    assert ev.fields["size"] == SIZE
+    assert ev.fields["cnt"] == CNT
+    assert ev.fields["w"] == W
+    assert ev.fields["h"] == H
+    assert ev.fields["q"] == Q
+    assert ev.datagram_len == 0
+    assert ev.ts >= 0
+
+
+@pytest.fixture
+def h():
+    if len(JHDR) != 607:
+        pytest.fail("test vector jhdr_Q100.bin is not 607 B")
+    harness = LoopbackHarness()
+    try:
+        yield harness
+    finally:
+        harness.close()
+
+
+def test_complete_in_order_frame_produces_event_and_queue_frame(h):
+    dgrams, pages = frame_datagrams(frame_id=10, payload_tag=1)
+    for d in dgrams:
+        h.send(d)
+    h.col.wait_for(
+        "frame_complete for frame_id=10",
+        lambda e: e.kind == "frame_complete" and e.fields.get("frame_id") == 10,
+    )
+    h.col.settle()
+    completions = h.col.by_kind("frame_complete")
+    assert len(completions) == 1
+    assert_complete_fields(completions[0], 10)
+    # the three fragments were each parsed as video_fragment events
+    assert len(h.col.by_kind("video_fragment")) == 3
+
+    frames = h.wait_frames(1)
+    jpeg, ts = frames[0]
+    assert isinstance(ts, float) and ts >= 0
+    expected = reconstructed(pages)
+    assert jpeg == expected
+    # REQ-BOL-005: length == 607 + size + 2 = 607 + 2100 + 2 = 2709; framing exact
+    assert len(jpeg) == jpeg_size(SIZE) == 607 + SIZE + 2 == 2709
+    assert jpeg[:607] == JHDR
+    assert jpeg[-2:] == b"\xff\xd9"
+    h.settle(0.3)
+    assert h.pop_frames() == []  # exactly one frame in the queue
+
+
+def test_out_of_order_delivery_reassembles_in_index_order(h):
+    dgrams, pages = frame_datagrams(frame_id=11, payload_tag=2)
+    h.send(dgrams[2])  # last page first
+    h.send(dgrams[1])  # then mid
+    h.send(dgrams[0])  # frag0 completes the key
+    h.col.wait_for(
+        "frame_complete for out-of-order frame_id=11",
+        lambda e: e.kind == "frame_complete" and e.fields.get("frame_id") == 11,
+    )
+    frames = h.wait_frames(1)
+    jpeg, _ts = frames[0]
+    # Distinguishable page payloads prove concatenation by INDEX, not arrival:
+    assert jpeg == JHDR + pages[0] + pages[1] + pages[2] + b"\xff\xd9"
+    assert jpeg == reconstructed(pages)
+    assert len(jpeg) == jpeg_size(SIZE)
+
+
+def test_interleaved_frames_1_and_2_complete_without_cross_contamination(h):
+    d1, p1 = frame_datagrams(frame_id=1, payload_tag=5)
+    d2, p2 = frame_datagrams(frame_id=2, payload_tag=9)
+    for i in range(CNT):  # strictly alternating halves
+        h.send(d1[i])
+        h.send(d2[i])
+    h.col.wait_for_count("frame_complete", 2, timeout=5.0)
+    h.col.settle()
+    completions = h.col.by_kind("frame_complete")
+    assert {e.fields["frame_id"] for e in completions} == {1, 2}
+    for ev in completions:
+        assert_complete_fields(ev, ev.fields["frame_id"])
+
+    frames = h.wait_frames(2)
+    assert {f[0] for f in frames} == {reconstructed(p1), reconstructed(p2)}
+    assert len(frames[0][0]) == jpeg_size(SIZE) and len(frames[1][0]) == jpeg_size(SIZE)
+    h.settle(0.3)
+    assert h.pop_frames() == []
+
+
+def test_more_than_16_pending_keys_prunes_oldest_first(h):
+    # 18 frag0-only datagrams -> 18 pending keys; exceeding 16 prunes the two
+    # oldest keys (frame_ids 1 and 2) with frame_dropped {"pruned": True}.
+    for fid in range(1, 19):
+        h.send(fragment(fid, 0, CNT, SIZE, mkpage(fid, 1024)))
+    deadline = time.monotonic() + 5.0
+    while len(h.col.by_kind("frame_dropped")) < 2:
+        h.col.pump()
+        if time.monotonic() >= deadline:
+            pytest.fail("timeout waiting for 2 frame_dropped prune events")
+        time.sleep(0.02)
+    h.col.pump()
+    for ev in h.col.by_kind("frame_dropped"):
+        assert ev.fields.get("pruned") is True
+    h.col.settle(0.3)
+    assert len(h.col.by_kind("frame_dropped")) == 2  # exactly the two oldest keys
+
+    # Completing every surviving key (3..18) proves pruning removed the OLDEST:
+    fid_pages = {}
+    for fid in range(3, 19):
+        pg = [mkpage(fid, 1024), mkpage(fid + 100, 1024), mkpage(fid + 200, 52)]
+        fid_pages[fid] = pg
+        h.send(fragment(fid, 1, CNT, SIZE, pg[1]))
+        h.send(fragment(fid, 2, CNT, SIZE, pg[2]))
+    deadline = time.monotonic() + 5.0
+    while len(h.col.by_kind("frame_complete")) < 16:
+        h.col.pump()
+        if time.monotonic() >= deadline:
+            pytest.fail("timeout waiting for 16 completions after pruning")
+        time.sleep(0.02)
+    h.col.pump()
+    completions = h.col.by_kind("frame_complete")
+    assert {e.fields["frame_id"] for e in completions} == set(range(3, 19))
+    frames = h.wait_frames(16)
+    got = {f[0] for f in frames}
+    want = {reconstructed(fid_pages[fid]) for fid in range(3, 19)}
+    assert got == want
+    h.settle(0.3)
+    assert h.pop_frames() == []
+
+
+def test_transport_keeps_running_after_malformed_input(h):
+    # REQ-BOL-003/004: malformed datagrams are dropped + reported, and the
+    # transport "keeps processing others".
+    h.send(struct.pack("<4sIII", b"\x93\x04\x10\x00", 1, 2, 3) + b"\x00")  # 17 B heartbeat
+    h.send(bytes([0x93, 0x07]) + b"\x08\x00\x00\x00")  # unknown type byte 7
+    h.send(fragment(4711, 1, CNT, SIZE, mkpage(3, 512)))  # mid page shorter than 1024
+    deadline = time.monotonic() + 5.0
+    while len(h.col.by_kind("malformed")) < 2 or len(h.col.by_kind("unknown_type")) < 1:
+        h.col.pump()
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                f"timeout waiting for malformed feedback; "
+                f"malformed={len(h.col.by_kind('malformed'))} "
+                f"unknown_type={len(h.col.by_kind('unknown_type'))}"
+            )
+        time.sleep(0.02)
+    h.col.settle(0.3)
+    assert len(h.col.by_kind("malformed")) == 2
+    ut = h.col.by_kind("unknown_type")
+    assert len(ut) == 1 and ut[0].fields["type"] == 7
+    assert h.col.by_kind("frame_complete") == []
+    h.assert_no_frames()
+
+    # ...and a complete valid frame sent afterwards still finishes.
+    dgrams, pages = frame_datagrams(frame_id=21, payload_tag=4)
+    for d in dgrams:
+        h.send(d)
+    h.col.wait_for(
+        "frame_complete after malformed burst",
+        lambda e: e.kind == "frame_complete" and e.fields.get("frame_id") == 21,
+    )
+    frames = h.wait_frames(1)
+    assert frames[0][0] == reconstructed(pages)
+    assert len(frames[0][0]) == jpeg_size(SIZE)
