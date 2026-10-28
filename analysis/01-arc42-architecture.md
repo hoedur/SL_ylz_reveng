@@ -2,7 +2,7 @@
 
 Reverse-engineered from `SL+ylz_V1.0.23.251121_APKPure.xapk`\
 Package: `com.xiaozhen.beauty.shenglong` · Version 1.0.23 (code 23) · minSdk 23, targetSdk 35\
-Analysis date: 2026-10-17 (live-device validation 2026-10-23/24, §10b) · Method: manifest/resource decode (androguard), DEX bytecode inspection, native `.so` symbol/string analysis
+Analysis date: 2026-10-17 (live-device validation 2026-10-23/24/26/27, §10b + doc-04 §9) · Method: manifest/resource decode (androguard), DEX bytecode inspection, native `.so` symbol/string analysis
 
 ---
 
@@ -99,8 +99,8 @@ The app is closed-source, phones home, and its privacy posture is poor (see §10
 - Same transport family but implemented **natively in `libbl_vii_jni.so`**: the JNI lib itself creates the UDP socket (`bind`, `sendto`, `getaddrinfo`, `thread_recv`, `thread_timer`), does MCU message handling (`handle_mcu_msg_ctlmsg`, `handle_mcu_msg_frag`, `queryinfo_resp`, `build_send_ack`).
 - Exported NDK procs: `mjpeg_ndk_startup/start/stop/command_send/queryinfo_cmd_send/set_active_camera_index/set_QPara/frame_callback_register/ctlmsg_cb_register`.
 - Distinguishing detail: static **JPEG headers for 640×360 @ Q5..Q100** are embedded in the .so — the native lib reconstructs a valid JPEG by patching/quantized headers when the MCU only streams payload fragments.
-- Camera resolution profile: **640×360 JPEG**, quality configurable (`setQPara(int…)`), `setActiveCameraIndex` — two cameras possible.
-- **→ Live-validated protocol of this driver (device ports 8800/1234, `EF`/`0x93` token framing, ping-serve paging, full fragment-header field map and the working Q100 decode recipe): §10b.**
+- Camera resolution profile: **640×360 JPEG** *(static-analysis view; the live-validated wire raster is 640×480 with per-frame SOF0 patching — §10b.4/§10b.11b)*, quality configurable (`setQPara(int…)`) *(not exercised by the app — §10a)*, `setActiveCameraIndex` — two cameras possible.
+- **→ Live-validated protocol of this driver (device ports 8800/1234, `EF`/`0x93` token framing, ping-serve paging, full fragment-header field map and the per-frame-quality decode recipe with SOF0 dims patch, corrected 2026-10-24/27): §10b.**
 
 #### T2.3 USB/UVC mode (`SOC_USB`)
 - Standard **UVC** camera discovered by `USBMonitor` (serenegiant) with `device_filter.xml` (class 0xEF/0x02).
@@ -193,7 +193,7 @@ Two independent transports:
 
 ### 10.2 Video stream details
 - **In-flight (transport) format = JPEG/MJPEG**, **640×360 pix**, native stack contains fixed JPEG headers for quality Q5–Q100 with MJPEG payloads (`jpeg_header_640x360_Q10 … Q100` in `libbl_vii_jni.so`), so every frame is an **independently-coded JPEG (intra-only "MJPG")** — no GOP, no B-frames, trivially cuttable.
-- Bitrate: implicit from JPEG quality/fragment size; typical such probes run ~8–15 fps ≈ **1–4 Mbps**, controlled via `setQPara` (quality) — not an encoder bit rate ceiling.
+- Bitrate: implicit from JPEG quality/fragment size; typical such probes run ~8–15 fps ≈ **1–4 Mbps**, controlled via `setQPara` (quality) — not an encoder bit rate ceiling *(corrected 2026-10-27: quality is NOT client-controlled in the live-validated BoliU family — `setQPara` has zero Java call sites (§10a) and the device self-varies the announced q per frame, §10b.6; fps superseded: 16.1–16.2 sustained for the app, ~3–4 fps for ping-mode clients, §10b.7/§10b.10)*.
 - No audio in the stream; recorded audio is the phone mic (AAC 44.1 kHz/64 kb/s), muxed on-device.
 - Recording output: **H.264 MP4**, encoded by Android MediaCodec from the decoded/rendered bitmaps/GL surface (target bitrate ≈ width·height·0.63·15).
 - Static still capture = one of the in-flight JPEG frames written to file, no re-encode needed in the clean path.
@@ -231,7 +231,7 @@ Findings from a full DEX string-pool cross-reference sweep (V1.0.23):
 
 - **Camera IP**: not hardcoded at call sites — `BekenSdk.start(ip)` / `BlSdk.start(ip)` take it as a parameter; `PreviewActivity`/`PreviewFullActivity` fall back to hardcoded `192.168.169.1` when the passed value is empty/invalid. `HomeActivity$DetectRunable` auto-detects camera mode: phone's own IP contains `192.168.169.` or WiFi SSID contains `D100` / `BK_` (probe SSID prefixes). Subnets seen: `192.168.0.1`, `192.168.1.1`, `192.168.169.x` (gateway `192.168.169.1`).
 - **WiFi AP↔STA switching / joining an existing WLAN**: *not implemented*. `ConnectActivity.onActionWifiSetup()` only opens the Android system WiFi panel (`SystemUtils.openWifiPanel`); the user manually joins the probe's hotspot. No SSID/password/config command is ever sent to the device.
-- **Image quality (WiFi probes)**: `BlSdk.setQPara` / `setActiveCameraIndex` are exported JNI functions but have **zero Java call sites**; only `getInstance / setJpegListener / start / stop` are used. Firmware supports variable JPEG quality (embedded Q5..Q100 header table in `libbl_vii_jni.so`), but the app never exercises it at runtime. **Live corroboration (§10b): the delivered unit streams at a fixed effective quality and ignores the announced quality byte for decode purposes; no quality control could be exercised on the wire.**
+- **Image quality (WiFi probes)**: `BlSdk.setQPara` / `setActiveCameraIndex` are exported JNI functions but have **zero Java call sites**; only `getInstance / setJpegListener / start / stop` are used. Firmware supports variable JPEG quality (embedded Q5..Q100 header table in `libbl_vii_jni.so`), but **not client-controlled** — live corroboration (§10b, corrected 2026-10-24): the device itself varies the announced quality byte per frame (25/50/75) and the phone prepends the matching embedded head; no live quality-control command is exercised.
 - **UVC hardware controls (USB probes)**: complete UVC Processing-Unit control set is exposed by the serenegiant wrapper — `PU_BRIGHTNESS_CONTROL`, `PU_CONTRAST_CONTROL`, `PU_CONTRAST_AUTO_CONTROL`, `PU_GAIN_CONTROL` (UVC `D0/D1/D18/D9`), with get/set + limit probing (`nativeObtain*Limit`). This is the real, usable quality/exposure channel for USB devices.
 - **Dead provisioning SDK**: the full `com.vidure.libs.transport` stack (HTTP device login `DEV_LOGIN_SESSION_REQ_NVT/_VY`, TCP/UDP transports, SoC response parsers for **Hisilicon, MStar, NVT, Nello, AllWin, Goplus, Jieli**) is bundled but **never invoked** from any `com.xiaozhen` class; the orphaned config key `XXX_DFT_IPADDR` ("XXX" = vendor placeholder) sits unreferenced in the string pool.
 - **Sample/fps/bitrate parameters** are compile-time constants (44.1 kHz, 64 kbps AAC, 15 fps, BPP 0.63) and govern only the **phone-side recording**; the camera device streams no audio and has no on-wire audio-parameter configuration.
@@ -257,7 +257,9 @@ Phone always at DHCP address `192.168.169.2`.
 | UDP **63736** | device | Accepts nothing, sends nothing (maybe firmware blob/log port). Unresolved, non-blocking. |
 
 **Connection model:** pure UDP, connectionless. The device learns the client's `ip:port` from whatever
-datagram arrives at 8800 (payload **not** validated — arbitrary bytes also (re)arm/redirect the stream),
+datagram arrives at 8800 (payload **not** validated — arbitrary bytes also (re)arm/redirect the stream
+*(single-datagram re-arm/redirect, live-verified; note the later falsification: sustained delivery is
+NOT guaranteed by arbitrary datagrams — see §10b.11b/§9.9, report-mode sessions open but then halt)*),
 and thereafter targets video + heartbeats to that socket ("sticky port"). The client must keep sending
 datagrams to 8800 to sustain delivery — **ping-serve model** (§10b.3).
 
@@ -268,7 +270,7 @@ Device→phone: `[0x93][msg_type][len LE16][payload…]`; `len` == whole datagra
 
 | msg side | type | meaning |
 |---|---|---|
-| dev→phone | **1** | video fragment (payload = 56-byte fragment header, frag0 = 67-byte header incl. 15-byte extension, §10b.4) |
+| dev→phone | **1** | video fragment (payload = 56-byte fragment header — **every** fragment, incl. frag0; frag0 additionally appends 11 trailing ASCII bytes at `d[len-11:len]`, amended 2026-10-27, §10b.4) |
 | dev→phone | **4** | 16-byte heartbeat, every 1.60 s (§10b.5) |
 | dev→phone | 2/3/5..8 | static handlers exist (`handle_mcu_msg_ack/ctlmsg/queryinfo_resp`); exact TBB mapping unresolved |
 | phone→dev | **0** | `EF 00 04 00` — "start"/serve-ping, 4 bytes, no payload (`thread_timer` log `----------- Sending start`) |
@@ -284,13 +286,18 @@ Device→phone: `[0x93][msg_type][len LE16][payload…]`; `len` == whole datagra
 3. **Maintenance:** after a *single* ping only ~1 frame arrives, then delivery stops. Sustained streaming
    requires the client to keep pinging — the shipped app wakes `thread_timer` to resend `EF 00 04 00`
    whenever no frame arrived for **≥101 ms**. Effective rule for a FOSS client: **ping every ~90 ms**;
-   any datagram to 8800 re-arms the stream.
+   any datagram to 8800 re-arms the stream *(retracted 2026-10-27 late: "any datagram re-arms" held
+   for the observed single-ping redirections, but sustained delivery is NOT guaranteed by arbitrary
+   datagrams — EF-02-only sessions open and then halt (§10b.11b / doc-04 §9.6 D / §9.9 EXP3); the
+   ping-serve regime remains the only one that sustains OUR client's stream).*
 4. A second client on a different socket simply steals the stream target. There is no session handshake,
    no auth, no join/leave protocol apart from datagrams arriving at 8800.
 
 ### 10b.4 Video fragment format (`msg_type=1`, verified on 29/29 frames)
 
-Datagram budget: frag0 = 67 + 1024 = **1091 B**, middle = 56 + 1024 = **1080 B**, last = 56 + remainder.
+Datagram budget (amended 2026-10-27, wire-exact): frag0 = 56 + 1024 + 11 = **1091 B** (11 trailing
+ASCII metadata bytes), middle = 56 + 1024 = **1080 B**, last = 56 + remainder; page slice for
+frag0 = `d[56:1080]`.
 
 Fragment header fields (offsets within the UDP payload; u32 LE unless noted):
 
@@ -306,15 +313,15 @@ Fragment header fields (offsets within the UDP payload; u32 LE unless noted):
 | 36..39 | u32 | **fragment count** = `ceil(size/1024)` | 22 for 21 962 B ✓ |
 | 40..43 | u32 | **frame size in bytes** | e.g. 14059, 20932, 33518, 33634, 21962… |
 | 44..45 | u16 | width = 640 (`0x0280`) | const |
-| 46..47 | u16 | height field = 480 (`0x01E0`) — **bogus/unused**; real JPEG is 640×360 | const |
-| 48..49 | u16 | quality/status word: low byte = quality (`0x19`=25, `0x4b`=75 …), high byte = frame id−1 | don't trust for decode |
+| 46..47 | u16 | height field = 480 (`0x01E0`) — the REAL raster height; the template heads' 640×360 SOF0 is patched per frame to the announced (w,h) by the native decoder (CORRECTED 2026-10-27, §10b.11b) | const |
+| 48..49 | u16 | quality/status word: low byte = quality (`0x19`=25, `0x4b`=75 …), high byte = frame id−1 | low byte IS the head-selection key (corrected 2026-10-24; §10b.6) |
 | 50..51 | u16 | 2 | const |
-| 52..55 | u32 | frag0 only: `0x0438000b` — low u16 = **11** = extra-byte count; high u16 = 1080 | 0 elsewhere |
-| 56..66 | — | frag0 only: **11 varying bytes** (unknown, non-critical, skipped by the decode recipe) | varies |
-| 67../56.. | — | page data: frag0 from byte 67 (1024 B); others from byte 56 (1024 B; last = `size` remainder) | |
+| 52..55 | u32 | frag0 only: `0x0438000b` — low u16 = **11** = trailing-byte count; high u16 = 1080 | 0 elsewhere |
+| 56.. | — | page data: **every** fragment carries its page from byte 56 (frag0: `d[56:1080]`, 1024 B; others: 1024 B; last = `size` remainder) | |
+| len-11..len | — | **frag0 only: 11 trailing ASCII metadata bytes** (amended 2026-10-27 — NOT page data; e.g. `-0214,-0894`, candidate sensor readouts; natively stashed at `slot+0x1000a4` by block `0x26e8–0x2702`). The earlier reading "11 varying bytes at offsets 56..66 / frag0 header 67 B" was inverted | varies |
 
 Frame integrity: Σ(fragment data) == field @40 exactly; Σ(header overhead) = 1243 B for cnt=22
-(67 + 20·56 + 56) — verified on all captured frames.
+(22×56 + 11) — verified on all captured frames.
 
 ### 10b.5 Heartbeat (`msg_type=4`, 16 bytes, every 1.60 s)
 
@@ -327,30 +334,50 @@ Frame integrity: Σ(fragment data) == field @40 exactly; Σ(header overhead) = 1
   during vigorous waving except a single LSB). Meaning unresolved (counter/temperature/battery?).
 - The heartbeat **follows the active streaming socket** (sticky target confirmed). Not required for streaming.
 
-### 10b.6 JPEG reconstruction (decode recipe, validated 29/29 + 4/4 legacy frames)
+### 10b.6 JPEG reconstruction (decode recipe — CORRECTED 2026-10-24, late session)
 
 ```
-jpeg  = jpeg_header_640x360_Q100 (607 B, ends after SOS — from libbl_vii_jni.so)
+jpeg  = jpeg_header_640x360_Q<q> with SOF0 dims patched to the announced (w=640, h=480)
+      (template 605 B, ends after SOS — extracted from libbl_vii_jni.so; RAM 2026-10-27)
       + fragment page data in index order (1024 B each, last short)
       + FF D9 (EOI)
 ```
-- Decodes as stock JPEG (PIL / libjpeg-turbo) to **640×360 RGB**.
-- ⚠ The announced quality byte (0x4b=75) does **not** identify the correct header — **Q100 is the one
-  that decodes** (its finer DQT tolerates the actual coefficient magnitudes; Q5..Q75 fail "broken data
-  stream"). FOSS clients should use the Q100 head fixed, or fall back trying heads best-match first.
+
+where `q` = the **announced quality byte = low byte of the u16 at fragment offset 48**
+(live values 25/50/75; the byte49 half varies 0/1 = camera/sub-index, semantics open).
+
+- Decodes as stock JPEG (PIL / libjpeg-turbo) to **640×480 RGB** with correct colorimetry (the template 640×360 canvas clips the bottom 120 rows — corrected 2026-10-27 §10b.11b; the former "pre-EOI extraneous bytes" are the bottom raster rows' entropy).
+- **Native selection rule (disassembly evidence, `handle_mcu_msg_frag` @0x267e–0x2698):** the app
+  compares the announced quality byte against 5/10/25/50/75/100 and prepends the matching embedded
+  head; no match → keep the previous head (sticky). The device itself varies `q` per frame —
+  quality is *adaptive*, not configurable (no `setQPara`; the variation is scene-driven).
+- ⚠ **Corr 2026-10-24 (supersedes the earlier "always Q100" and "q does not map" claims — both were
+  artifacts of a 2-byte over-extraction):** the six embedded heads sit at a **605-byte stride**
+  (0x4c1a, 0x4e77, 0x50d4, 0x5331, 0x558e, 0x57eb); heads are **605 B** each. The earlier 607-byte
+  extractions each dragged in a 2-byte stray tail (literal `FF D8` for Q5..Q75 → "broken data stream",
+  false negative; `5D 02` for Q100 → 2-byte-shifted entropy stream → validated-but-washed-out-grey
+  image, the prototype's originally reported color defect). Details: `04-live-device-validation.md` §5b-2.
 - The device **never transmits** a JPEG header (no SOI/DQT/DHT/SOF/SOS on the wire); the phone-side
   table is mandatory.
-- Frame sizes are motion-dependent (≈12–30 kB at 640×360 → 0.77–1.1 bpp).
+- Frame sizes are motion- AND quality-dependent (observed 14 k B @ q25 up to 33.6 kB @ q75;
+  ≈0.6–1.2 bpp at 640×360 *(bpp base corrected 2026-10-27 for the 640×480 raster: measured
+  10 867–40 384 B/frame ⇒ 0.57–1.05 bpp @ 640×480)*).
 - Negative results (decoded-nothing): XOR-constant sweep, bit-reverse, nibble-swap, 16-bit byte-swap —
   no transform exists.
 
 ### 10b.7 Throughput profile (empirical)
 
 - Fragment transmission itself is fast (21 fragments in ~22 ms).
-- Delivery is **bursty**: clusters of 1–4 frames at 30–45 ms spacing (~25 fps intra-burst) separated by
-  ~0.45–0.52 s idles, *independent of motion*. Effective ≈ 3–4 fps (static scene) — the 0.5 s stalls are
-  device-side chunky delivery, so a client must buffer/jitter-normalize for a smooth preview.
-- Motion increases frame size, not cadence.
+- **With our prototype's client (`EF 00 04 00` pings only):** delivery is bursty — clusters of 1–4
+  frames at 30–45 ms spacing (~25 fps intra-burst) separated by ~0.45–0.52 s idles,
+  *independent of motion*. Effective ≈ 3–4 fps (static scene); the 0.5 s stalls are device-side
+  chunky delivery, so a client must buffer/jitter-normalize for a smooth preview.
+- **With the ORIGINAL app (2026-10-26 monitor capture, §9.5 of doc 04): sustained ≈ 14.1 fps**
+  *(duty-limited estimate; superseded 2026-10-26 by the lossless capture: **16.1–16.2 fps** —
+  see §10b.10 / doc-04 §9.6)*
+  (OLS frame-id slope; 1119 frames over 79.4 s), near-continuous inter-fragment tempo while
+  capturing, frames ~44 kB @ q=75. NOT ping-gated (§9.2) — see §10b.10 (receive-progress
+  reports as the likely pacing lever).
 
 ### 10b.8 What this unit does **not** implement (corrections to earlier assumptions)
 
@@ -360,9 +387,9 @@ jpeg  = jpeg_header_640x360_Q100 (607 B, ends after SOS — from libbl_vii_jni.s
    reactions on this unit.
 3. **No sensor channel** — no orientation data is streamed by this device in any form (heartbeat drift
    word is not an accelerometer).
-4. **No device configuration** — live corroboration of §10a: no AP/STA switch, no quality change occurs
-   at runtime despite `setQPara`/the Q5..Q100 header table being present (the firmware streams at a
-   fixed effective quality regardless of the announced byte).
+4. **No device configuration** — live corroboration of §10a: no AP/STA switch, and no *client-controllable*
+   quality change occurs despite `setQPara` (the Q5..Q100 header table is present but picked by the
+   device's own per-frame announcement; the device self-varies q = 25/50/75, §10b.6).
 5. Device reboot mid-session: full state reset (heartbeat seq reset to 1, stream target cleared) —
    clients must re-arm by pinging again.
 
@@ -377,10 +404,10 @@ this as a **pluggable `DeviceTransport`** with at least these capabilities per i
 |---|---|---|
 | frame transport (sockets vs UVC endpoint) | SoC family | UDP 8800 ping / 1234 data |
 | fragment / framing format | firmware | 56-byte header (§10b.4), 1024-B pages |
-| JPEG header strategy | per-device | phone-side Q100 head prepend + EOI |
-| resolution / quality preset | device/firmware | 640×360; quality not adjustable |
-| keep-alive / session semantics | firmware | ping-serve ≤101 ms, sticky port |
-| attitude/sensor channel | optional, per family | **absent** |
+| JPEG header strategy | per-device | phone-side per-frame `q` head prepend (605 B heads, §10b.6) + EOI |
+| resolution / quality preset | device/firmware | wire raster 640×480 (SOF0-patched per frame, §10b.11b); quality self-varies per frame (25/50/75), not client-adjustable |
+| keep-alive / session semantics | firmware | EF-00-04 ping-serve ≤101 ms (our client) vs EF-02 reports + EF-08 1.6 s keepalive (app, §10b.10); sticky port |
+**| attitude/sensor channel | optional, per family | **absent** *(candidate caveat 2026-10-27: the frag0 trailing 11 ASCII bytes, e.g. `-0214,-0894`, look like sensor readouts — §10b.4 / doc-04 §9.9; verify before reimplementing)* |
 | command set (still capture, voice, OTA) | optional, per family | none exercised |
 | device address / discovery | subnet scheme | `192.168.169.1` AP gateway |
 
@@ -388,6 +415,122 @@ Everything downstream (decode → rotate/filter → render → record → captur
 shared; only these rows get new implementations per controller family (Beken `SOC_BEKEN` = the
 bytecode-derived UDP 7080/TCP 2271 pair; UVC = traditional USB video; unknown future families = new
 plug-in + packet-debug screen, cf. `03-reimplementation-proposal.md` §2.2).
+
+### 10b.10 Client→device message family of the ORIGINAL app (monitor capture 2026-10-26)
+
+From `analysis/04-live-device-validation.md` §9.5 / `artifacts/app_stream_2026-10-26/`. All client
+datagrams leave the app socket (ephemeral) bound for `device:8800`, framing `[EF][type][len LE16
+= total datagram length][body]` (the same `len16 == len(d)` convention as device frames):
+
+1. **`EF 02 …` receive-progress reports (the stream's pacing lever).** Body = `02 02 00 01` magic,
+   `count` u32 (number of records), 12 zero bytes, constant `0A 4B 14 2D` at datagram offset 24
+   (corrected 2026-10-26 from the lossless capture — an earlier byte-offset guess put the const at
+   28), 4 zero pad bytes, then `count` × records, then an 8-byte zero tail. **Record** = `{fid u64
+   LE, state u32 (1=complete, 0=in-flight, 3=not-running), recSize u32 (0x18=24 B with u64
+   fragment bitmask; 0x14=20 B with u32 bitmask; 0x10=16 B no bitmask)}`. `fid` of the first
+   record = **last fully received frame id** (lags the stream by ~1 frame). Observed datagram
+   forms 2026-10-26 (lossless 45 s tape): 64 B/1 rec (state 1, ffffffff u64 mask — dominator),
+   60 B/1 rec (state 1 with 32-B mask ffffffff, for ≤32-page frames), 40 B/0 rec (empty — ~2–3/s,
+   also mid-stream, not only at start), 76/80/88 B/2 rec, 96/104 B/3 rec. `len16` = datagram total.
+   **Per-record layouts verified byte-exact**; report cadence: ~26.4/s in a fresh session
+   (778 msgs/29.5 s), ~39/s sustained in a long-running session (1771/45 s) — the earlier
+   "~8.8 reports/s" was a capture-duty artifact.
+2. **`EF 08 08 00 <u32>`** 8-byte keepalive every ~1.64 s; u32 = seconds since stream start.
+   The device heartbeat (`93 04 …`) **seq equals this counter** — both count stream age.
+3. **Bootstrap (corrected 2026-10-26, app-restart tape): the app DOES send the 4-byte
+   `EF 00 04 00` ping — exactly twice at session start (+0.00 s and +0.10 s), never again.**
+   After it: two 40 B empty reports, then continuous record reports. The device's first video
+   fragment reaches the client **0.10 s after the first bootstrap ping**; the session's frame-id
+   counter then runs from **1**. Under ping-only clients the device throttles to ~3–4 fps
+   (§10b.7, §9.2); the report-driven app sustains ~16.1–16.2 fps (fid-slope, lossless tape;
+   earlier "14.1 fps" was duty-limited).
+   **H-1 status (live-tested 2026-10-26): UNSETTLED.** Every attempted report-only/
+   ping+report client variant (const@24 byte-exact 64-B reports at 9/26/39/63 Hz, 2-record
+   reports with synthesized in-flight bitmask, after (2×ping + 2×empty) bootstrap) shows the arm
+   burst (2–11 frames) and then **permanent delivery halt while heartbeats continue**. The app
+   session streams minutes on report-only; the missing device-side condition is not yet
+   identified — open hypotheses: device-registered client-slot semantics beyond the ping,
+   in-flight record bitmask bit-order/meaning (mask semantics did not correlate with received
+   pages even with a lossless capture), or per-session bookkeeping. See doc-04 §9.6.
+
+---
+
+### 10b.11 ✅ App-native JPEG decode semantics == prototype reassembly (validated 2026-10-26, late)
+
+> **Superseded in part 2026-10-27 — see §10b.11b** (adversarial gate FAILED 3/5;
+> corrections: 640×480 raster + per-frame SOF0 patch, warning-blind PIL, artifact
+> attribution). The shared-semantics inventory below remains correct.
+
+The shipped app's decode algorithm was extracted from `libbl_vii_jni.so`
+(`handle_mcu_msg_frag` @0x230c, unstripped symbols; helper @0x2640) and is **byte-equivalent
+to the prototype's** (`boliu.py`, REQ-BOL-004/005) *(superseded 2026-10-27 late, gate round 0:
+see §10b.11b — one division was found: the page0 slice; corrected in both)*: q selection =
+single byte at **d[48]** against the LUT {5,10,25,50,75,100} (miss → sticky previous head,
+initial Q100); full 605-B head memcpy; page payload d[67:] (idx 0 — the 11 frag0 extra bytes
+are arithmetic metadata, dropped) / d[56:] (others); contiguous assembly at `idx*1024`;
+retransmit = re-copy into the same destination (last-version-wins); **EOI appended only when
+idx == cnt-1 arrives**.
+*(Page-slice correction 2026-10-27, amended §10b.4: frag0's 11 bytes are TRAILING at
+`d[len-11:len]` and the page is `d[56:1080]` — the `d[67:]` slice shifted the entropy 11 B.
+Fragment recount: 34 862 fragments (22 152 live_now + 12 710 session_start5) of the
+22 158+12 711 0x93-0x01-typed datagrams; the delta = 7 short control datagrams + heartbeats.
+All 78 261 fragments of all taped sessions: 0 page-boundary anomalies.)*
+Empirically, page-boundary arithmetic was verified per datagram on all 22 152 device
+datagrams of the lossless app tape (**0 anomalies**); all 10 completely captured frames decode
+warning-free (640×360, q=75/50) *(this sentence's warnings claim measured nothing — Pillow;
+superseded by §10b.11b/§9.9, all frames are djpeg-clean under the corrected slice at
+640×480)*; first-version vs overwrite distinguishes on 0 frames.
+The user-visible live artifacts (left/top stripes of previous-frame pixels, occasional
+single-frame color shift) are therefore **not** reassembly bugs: left/top is page-0 payload
+start, pointing at device-side page-buffer reuse in our stalled (non-drained) delivery
+regime — the same regime that produces the live-only ~6.4 kB "extraneous bytes before marker
+0xd9" quirk (§10b.6 / doc-04 §9.4), which never reproduces on tape; the low effective fps
+(§10b.7) keeps that ring-drain mismatch regime alive. See doc-04 §9.7.
+
+> **Superseded 2026-10-27 late (gate round 0, validator 1):** the entire striping
+> paragraph above is retracted — it reasoned over the wrong page0 slice (`d[67:]`, 11-B
+> entropy shift). The stripes were the prototype's own slice bug (see §10b.11b item 3 /
+> doc-04 §9.9); the "live-only quirk never reproduces on tape" framing was an artifact of
+> the over-extracted 607-B artifact heads (§5b-2), later re-explained as bottom-raster
+> entropy and now warning-free under the corrected slice.
+
+### 10b.11b. Gate outcome: corrections to §10b.11 (2026-10-27)
+
+The §10b.11 conclusion ran the required 5-agent adversarial gate and **failed it (3/5)**.
+Two validated refutations change the record (full evidence: doc-04 §9.8):
+
+1. **The wire raster is 640×480, not 640×360.** "bogus height 480" (§10b.4 field map) was
+   wrong: the native helper (@0x2640) patches the head copy's **SOF0 dims per frame**
+   from the announced w/h (write sites @0x26dc/0x26e4 → head+145 = BE16 height,
+   head+147 = BE16 width; call-site stash @0x240c/0x2414). Empirically w=640, h=480 on
+   **1 061/1 061** frag0 datagrams of both lossless app tapes. The prototype now does the
+   same (REQ-BOL-010, suite 96/96). The former "extraneous bytes before marker 0xd9"
+   quirk is **explained and benign**: trailing entropy = the bottom 120 raster rows a
+   360-canvas head cannot consume *(the small residual numbers — "fid 2080: 8 374 → 3
+   extraneous bytes", "premature end" — were artifacts of the wrong page0 slice, retracted
+   below; under the wire-exact slice the 480-canvas decode is djpeg-clean, 10/10, and
+   E360 = C480−C360 exactly = the bottom-120-row entropy.)*
+2. **Instrument correction:** Pillow (venv) never surfaces libjpeg warnings — the
+   "decode warning-free" claims of §10b.11 measured nothing; under `djpeg`, 10/10 tape
+   frames warn with 4.7–11.2 kB of (benign, pixel-identical-after-trim) surplus.
+3. *(REWRITTEN by gate round 0, 2026-10-27 late — the "artifacts live in the device's
+   own stream" verdict was reached under the wrong page0 slice and is retracted.)* The
+   top-band/"foreign content" artifact was **our own 11-B frag0 slicing bug**: under the
+   wire-exact slice (`page0 = d[56:len-11]`) all 10 tape frames decode djpeg-clean and
+   every MCU-row edge spike vanishes (`analysis/artifacts/frag0_layout_2026-10-27/`).
+   What survives from the gate: the SOF0 dims patch (item 1) and the app-side exposure
+   facts — the native completion scan never tests page-0's mask bit and recycles ring
+   slots (fid−4) without clearing buffers, so the *app* accepts page0-loss frames with
+   stale slot content; the prototype drops them (deliberate, safer divergence —
+   documented in REQ-BOL-005). *Newly opened candidates:* the 11 trailing ASCII tail
+   bytes = sensor-channel hypothesis; 7 short `[0x93][01]` control datagrams to classify.
+   Retest list moves to doc-04 §9.9.
+4. *(Round-1 amendment — wire-exact frag0 layout, validated 2026-10-27 evening:)*
+   page0 = `d[56:len-11]` (§10b.4 field map amended accordingly); helper base =
+   caller slot **+0x80** (earlier docs said "minus 0x80" — inverted); fragment header is
+   56 B for every fragment; recon/patch write sites unchanged. Prototype amended
+   spec-first (REQ-BOL-004, coordination entry); suite 96/96; the djpeg-clean 10/10
+   verification is the acceptance evidence.
 
 ---
 

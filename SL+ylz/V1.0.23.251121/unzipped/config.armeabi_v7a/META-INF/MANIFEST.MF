@@ -1,0 +1,23 @@
+Manifest-Version: 1.0
+
+Name: AndroidManifest.xml
+SHA1-Digest: LexD5tq8R3UodAYDFZUpcCtPuXA=
+
+Name: lib/armeabi-v7a/libUVCCamera.so
+SHA1-Digest: vqoZOdgLWLqa2TZzj8InzERzvbw=
+
+Name: lib/armeabi-v7a/libbl_vii_jni.so
+SHA1-Digest: 3hhEH2bEzyzVgaSAyFJf4bkC1mo=
+
+Name: lib/armeabi-v7a/libjpeg-turbo212.so
+SHA1-Digest: mlRsIwMTSG8pdqJBaZ01GDpjMA8=
+
+Name: lib/armeabi-v7a/libusb1.0.so
+SHA1-Digest: LbGN7RzW0nwBsy9v8DXGZkZ51rk=
+
+Name: lib/armeabi-v7a/libuvc.so
+SHA1-Digest: RZdvVdq+1rv/bGs7CTzfa/zy7kw=
+
+Name: stamp-cert-sha256
+SHA1-Digest: 5vTkm69vqAbusD/fho7oWwc7j+I=
+

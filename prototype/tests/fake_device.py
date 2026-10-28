@@ -9,12 +9,13 @@ Rules implemented here (the ONLY source: ARCHITECTURE.md §5 + REQ-BOL-003/004):
   no pacing.
 - Frame (§5 item 2): frame_id cycles 1,2,1,...; size default 2100 (cnt=3 -> pages
   1024+1024+52); payload = [i % 251 for i in range(size)].
-- Fragment datagram layout (§5 item 2 + REQ-BOL-004): framing prefix [0x93][01][len LE16]
-  then fragment header. frag0: 4 B framing + 63 B header -> page data starts at datagram
-  byte 67 (datagram = 67 + 1024 = 1091 B); mid/last: 4 B framing + 52 B header -> page at
-  byte 56 (mid = 1080 B, last = 56 + remainder B). REQ-BOL-004 byte offsets inside the
-  datagram: frame_id@8 (LE32), idx@32, cnt@36, size@40 (LE32), w@44, h@46, q@48 (LE16).
-  len16 (REQ-BOL-003) == full datagram length.
+- Fragment datagram layout (§5 item 2 + REQ-BOL-004, amended 2026-10-27 gate-1 wire-exact):
+  framing prefix [0x93][01][len LE16] then a 52-B fragment header in every fragment; frag0
+  additionally appends 11 trailing ASCII metadata bytes: page data starts at datagram byte 56
+  (frag0 = 56 + 1024 + 11 = 1091 B, page = d[56:1080]); mid/last: page at byte 56 with no tail
+  (mid = 1080 B, last = 56 + remainder B). REQ-BOL-004 byte offsets inside the datagram:
+  frame_id@8 (LE32), idx@32, cnt@36, size@40 (LE32), w@44, h@46, q@48 (LE16). len16 (REQ-BOL-003)
+  == full datagram length.
 - Heartbeat (§5 item 3, REQ-BOL-003): 93 04 10 00 <seq LE32> 04 00 00 00 <drift LE32>
   (16 B), one per 1.6 s (tolerated +-0.8 s in tests) after the first datagram while any
   datagram arrived in the last 5 s.
@@ -38,9 +39,10 @@ from collections import deque
 #: Client ping on the wire, REQ-BOL-002 (what a conforming transport sends every 90 ms).
 PING_BYTES = b"\xEF\x00\x04\x00"
 
-_FRAG0_PAGE_OFFSET = 67  # §5 item 2 + REQ-BOL-004: page of idx==0 datagram starts here
+_FRAG0_PAGE_OFFSET = 56  # §5 item 2 + amended REQ-BOL-004 (gate-1): frag0 page starts here
 _FRAGN_PAGE_OFFSET = 56  # REQ-BOL-004: page of idx>0 datagrams starts here
-_FRAG0_HEADER = _FRAG0_PAGE_OFFSET - 4   # 63 B after the 4 B framing prefix
+_FRAG0_TAIL = b"-0214,-0894"  # frag0-only trailing ASCII metadata, 11 B (amended REQ-BOL-004)
+_FRAG0_HEADER = _FRAG0_PAGE_OFFSET - 4   # 52 B after the 4 B framing prefix
 _FRAGN_HEADER = _FRAGN_PAGE_OFFSET - 4   # 52 B after the 4 B framing prefix
 _PAGE = 1024  # REQ-BOL-004 page length for idx==0 and mid fragments
 
@@ -65,10 +67,12 @@ def build_fragment(
     Byte layout (offsets are into the whole datagram, not the header):
       d[0]=0x93, d[1]=1, d[2:4]=len LE16, d[8:12]=frame_id LE32, d[32:36]=idx LE32,
       d[36:40]=cnt LE32, d[40:44]=size LE32, d[44:46]=w LE16, d[46:48]=h LE16,
-      d[48:50]=q LE16, page = d[67:] for idx==0, d[56:] otherwise.
+      d[48:50]=q LE16, page = d[56:len-11] for idx==0 (11-B trailing tail), d[56:]
+      otherwise.
     """
     header_len = _FRAG0_HEADER if idx == 0 else _FRAGN_HEADER
-    total = 4 + header_len + len(page)
+    tail = _FRAG0_TAIL if idx == 0 else b""
+    total = 4 + header_len + len(page) + len(tail)
     d = bytearray(total)
     d[0] = 0x93
     d[1] = 0x01
@@ -80,7 +84,10 @@ def build_fragment(
     struct.pack_into("<H", d, 44, w)
     struct.pack_into("<H", d, 46, h)
     struct.pack_into("<H", d, 48, q)
-    d[_FRAG0_PAGE_OFFSET if idx == 0 else _FRAGN_PAGE_OFFSET:] = page
+    page_start = _FRAG0_PAGE_OFFSET if idx == 0 else _FRAGN_PAGE_OFFSET
+    d[page_start : page_start + len(page)] = page
+    if tail:
+        d[len(d) - len(tail) :] = tail
     return bytes(d)
 
 

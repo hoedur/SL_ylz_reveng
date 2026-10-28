@@ -1,0 +1,24 @@
+{
+  "duration_s": 15.0,
+  "host": "192.168.169.1",
+  "port": 8800,
+  "snapshot": {
+    "by_kind": {
+      "frame_complete": 56,
+      "heartbeat": 11,
+      "ping": 166,
+      "stats_sample": 17,
+      "video_fragment": 1865
+    },
+    "bytes_rx": 1988953,
+    "datagrams_rx": 2042,
+    "decode_failed": 0,
+    "decode_ok": 56,
+    "fps_5s": 4.0,
+    "frames_complete": 56,
+    "kbps_rx": 132.122,
+    "pings_tx": 166,
+    "transport": "boliu"
+  },
+  "transport": "boliu"
+}

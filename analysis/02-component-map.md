@@ -109,7 +109,7 @@ sequenceDiagram
             D-->>P: [93][01][len LE16][56-B frag header][1024 B page]
             Note over P: reorder by fragment index (out-of-order ok)
         end
-        Note over P: jpeg = jhdr_Q100 (607 B) + Σ pages + FF D9 → decode 640×360 RGB
+        Note over P: jpeg = jhdr_Q(q) 605 B head, q = announced byte@48<br/>(§10b.6 / §5b-2 corrected)+ Σ pages + FF D9 → decode 640×360 RGB
     end
 ```
 

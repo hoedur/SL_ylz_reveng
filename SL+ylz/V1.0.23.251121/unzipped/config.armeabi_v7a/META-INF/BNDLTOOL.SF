@@ -1,0 +1,26 @@
+Signature-Version: 1.0
+Created-By: 1.0 (Android)
+SHA1-Digest-Manifest: 7/SWTFCnx0jUjuPendU6MQSlb5s=
+X-Android-APK-Signed: 2, 3
+
+Name: AndroidManifest.xml
+SHA1-Digest: pBfUXm/1gYQUxSbUNgBUKpsJAv0=
+
+Name: lib/armeabi-v7a/libUVCCamera.so
+SHA1-Digest: EjwL5EbSgiVcA2jsdqU/qCZE0wk=
+
+Name: lib/armeabi-v7a/libbl_vii_jni.so
+SHA1-Digest: axprl/OrcMzfe308AZq75jEIMns=
+
+Name: lib/armeabi-v7a/libjpeg-turbo212.so
+SHA1-Digest: CsRz1xnaO/XJu1USgK5948X1kXg=
+
+Name: lib/armeabi-v7a/libusb1.0.so
+SHA1-Digest: SN5vynTszU2xr0p17WLK8O5PW98=
+
+Name: lib/armeabi-v7a/libuvc.so
+SHA1-Digest: 0EPqzFaSd2v5XlTKKtNgxntUvyo=
+
+Name: stamp-cert-sha256
+SHA1-Digest: Bs40BvDZ1xrbgQrPTD2x5w/NfHQ=
+

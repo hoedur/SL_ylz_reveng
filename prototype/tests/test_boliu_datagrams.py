@@ -6,7 +6,8 @@ REQ-BOL-003/004:
 - transport head: d[0]=0x93, d[1] in {1,4}, len16 = LE16(d[2:4]) == len(datagram)
 - fragment datagrams: sig ``02 02 00 01`` @4, frame_id u32 LE @8, dup u32 LE @16,
   idx u32 LE @32, cnt u32 LE @36, size u32 LE @40, w u16 LE @44, h u16 LE @46,
-  q u16 LE @48; page data = d[67:] when idx == 0 (frag0, expects 1024 B),
+  q u16 LE @48; page data = d[56:len-11] when idx == 0 (frag0, expects 1024 B; 11-B
+  trailing tail), else d[56:],
   else d[56:] (mid: 1024 B, last: size - (cnt-1)*1024 B). Amended REQ-BOL-004:
   field access needs >= 50 B (shorter type-1 datagrams -> malformed); a parsed
   fragment yielding a zero-length page (datagram shorter than its head length)
@@ -39,6 +40,10 @@ W, H, Q = 640, 444, 77
 DEVICE_SRC_IP = "127.0.0.1"  # == transport's `host` (REQ-BOL-001 filter)
 DEVICE_SRC_PORT = 1234  # REQ-BOL-001: only datagrams from this port are accepted
 
+# amended REQ-BOL-004 (gate-1): frag0's trailing ASCII metadata on the wire
+# (example bytes observed at d[len-11:len]; stashed natively, not page data)
+FRAG0_TAIL = b"-0214,-0894"
+
 
 def mkpage(tag: int, length: int) -> bytes:
     """Deterministic tag-flavored page payload (not JPEG-decodable, per spec §5)."""
@@ -47,8 +52,11 @@ def mkpage(tag: int, length: int) -> bytes:
 
 def fragment(frame_id, idx, cnt, size, page, *, w=W, h=H, q=Q, dup=0):
     """Build one [0x93][01][len16] fragmented-video datagram per REQ-BOL-004."""
-    head = 67 if idx == 0 else 56
-    d = bytearray(head + len(page))
+    # amended REQ-BOL-004 (gate-1): every header is 56 B; frag0 appends 11
+    # trailing ASCII metadata bytes which are NOT page data.
+    head = 56
+    tail = FRAG0_TAIL if idx == 0 else b""
+    d = bytearray(head + len(page) + len(tail))
     d[0] = 0x93
     d[1] = 1
     struct.pack_into("<H", d, 2, len(d))
@@ -61,7 +69,9 @@ def fragment(frame_id, idx, cnt, size, page, *, w=W, h=H, q=Q, dup=0):
     struct.pack_into("<H", d, 44, w)
     struct.pack_into("<H", d, 46, h)
     struct.pack_into("<H", d, 48, q)
-    d[head:] = page
+    d[head : head + len(page)] = page
+    if tail:
+        d[len(d) - len(tail) :] = tail
     return bytes(d)
 
 
@@ -220,7 +230,7 @@ def assert_fragment_fields(ev, frame_id, idx, cnt, size, *, w=W, h=H, q=Q):
 
 
 def test_valid_frag0_produces_video_fragment_event(h):
-    d = fragment(42, 0, 3, 2100, mkpage(1, 1024))  # total 4+63+1024 = 1091 B
+    d = fragment(42, 0, 3, 2100, mkpage(1, 1024))  # total 4+52+1024+11 = 1091 B
     h.send(d)
     ev = h.col.wait_for(
         "video_fragment for frag0 frame_id=42",
@@ -373,9 +383,10 @@ def test_fragment_sanity_violations_are_malformed_and_push_nothing(h, case):
 def test_zero_page_fragment_is_malformed(h, idx, head):
     # Amended REQ-BOL-004: "a type-1 datagram that parses as a fragment but
     # yields a zero-length page (i.e. shorter than its head length) is also
-    # malformed" — a frag0 truncated to exactly its 67 B head, resp. a mid to
-    # its 56 B head; both are >= 50 B, so the fields parse.
-    bad = fragment(60, idx, 3, 2100, b"")  # page length 0 -> datagram == head
+    # malformed" — a frag0 with an empty page is 56 B head + 0-B page + 11-B
+    # tail = 67 B (still < 68 B), resp. a mid with an empty page is its 56 B
+    # head; both are >= 50 B, so the fields parse.
+    bad = fragment(60, idx, 3, 2100, b"")  # page length 0 -> datagram == head (+frag0 tail)
     assert len(bad) == head
     h.send(bad)
     h.col.wait_for(

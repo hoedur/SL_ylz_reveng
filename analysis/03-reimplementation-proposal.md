@@ -11,7 +11,7 @@ protocol in `04-live-device-validation.md` (arc42 §10b).
 | # | Requirement | Blocking? |
 |---|---|---|
 | R1 | Live 640×360 MJPEG preview from **USB UVC** ear scope, ~15–30 fps, low latency | yes |
-| R2 | Live **WiFi-JPEG** preview over the validated **BoliU/Bouffalo-Lab UDP protocol** (ping → UDP 8800, data → 1234, fragment reassembly + phone-side Q100 JPEG head) — **empirically validated against the physical unit** (`04-live-device-validation.md` / arc42 §10b) | yes (if WiFi hardware in use) |
+| R2 | Live **WiFi-JPEG** preview over the validated **BoliU/Bouffalo-Lab UDP protocol** (ping → UDP 8800, data → 1234, fragment reassembly + phone-side per-frame quality head) — **empirically validated against the physical unit** (`04-live-device-validation.md` / arc42 §10b) | yes (if WiFi hardware in use) |
 | R2b | Compatibility driver for the *Beken*-family path (UDP 7080 + framing `{0x20,0x36}`, TCP 2271 gyro) — kept as a pluggable fallback since no live unit exists to validate it | no |
 | R3 | **Optional** attitude stream + software rotation with frame↔angle pairing — only for device families that stream one (Beken: TCP 2271 packets; BoliU BL384: **none**). Sources other than the device (phone sensors, manual rotate) must be plug-compatible | yes (as optional source) |
 | R4 | Manual rotate for UVC mode (90° steps) + optional: 3-axis phone-sensor assist | yes |
@@ -66,7 +66,7 @@ scope-core/
  │   │                     reorder by frag index (u32@32), assemble by size (u32@40);
  │   │                     heartbeat [93][04][…16 B / 1.6 s] — optional stats only;
  │   │                     device profile: 640×360, NO sensor channel, no command/quality control
- │   │                     frame output: jpeg = embedded-header(Q100) + pages + FF D9
+ │   │                     frame output: jpeg = embedded-header(Q<q>, q = announced byte@48) + pages + FF D9
  │   ├─ beken_udp         ⬆ SECONDARY — bytecode-derived, NOT validated on live hardware:
  │   │                     7080 datagram FSM: cmd = {0x20,0x36} start, {0x20,0x37} stop;
  │   │                     framing: picId@2 pkType@3, len-4 payload, 1472 MTU,
@@ -95,7 +95,7 @@ must expose or parametrize (full evidence in arc42 §10b.9 / `04-live-device-val
 |---|---|---|---|
 | transport | UDP 8800 ping / 1234 data | UDP 7080 (+TCP 2271 side channel) | USB isochronous/bulk |
 | framing | 56-B frag header, 1024-B pages | ≤1472-B, picId/pkType, 102400-B buffer | MJPEG frames |
-| JPEG headers | none on wire → phone prepends Q100 head + EOI | self-contained | self-contained |
+| JPEG headers | none on wire → phone prepends the head matching the frame's announced quality + EOI | self-contained | self-contained |
 | resolution/quality | 640×360, fixed effective quality | 640×360 nominal, `setQPara` unused by app | UVC-negotiated + PU controls |
 | session | ping-serve (≤101 ms), sticky port | start/stop commands | file/FD open-close |
 | attitude | none | TCP 2271 packets | manual/phone |
@@ -112,7 +112,7 @@ must expose or parametrize (full evidence in arc42 §10b.9 / `04-live-device-val
      set bitmap bit `idx` — fragments may arrive out of order.
    - `type@1 == 4` (16 B) → heartbeat (optional).
    - When all `cnt` bits set → frame complete.
-4. Emit frame bytes = `jhdr_Q100_bin (607 B) + Σ pages in idx order + FF D9` → stock JPEG decode,
+4. Emit frame bytes = `jhdr_Q<q>_bin (605 B, q Low-byte of announced u16@48 — heads from the .so) + Σ pages in idx order + FF D9` → stock JPEG decode,
    640×360 RGB. (Q5..Q75 heads fail to decode; the announced quality byte is not the selection key.)
 5. Jitter-normalize: device delivers in bursts (~25 fps intra-burst) with ~0.5 s stalls (~3–4 fps
    effective); buffer on the display side.
@@ -160,7 +160,7 @@ strategy (R3):
    framing, ping-serve model, decode recipe and throughput profile are empirically confirmed;
    the "sniff-the-wire" plan item of the original proposal is fulfilled by `04-live-device-validation.md`.
 2. **Phase 1 — Android MVP (UVC + WiFi/BoliU)**: repo-first path is now the **validated BoliU UDP
-   driver + Q100 decode recipe**, alongside the UVC shell; record via MediaCodec; still capture is a
+   driver + per-frame-quality decode recipe**, alongside the UVC shell; record via MediaCodec; still capture is a
    frame passthrough (already a complete JPEG!). Remaining pre-code work: none for the core video path.
 3. **Phase 2 — attitude pluggability** (phone-sensor fusion default, device-TCP parser for Beken units, manual rotate), recording polish.
 4. **Phase 3 — Beken-family driver module** implementing the bytecode-derived protocol behind the same trait (re-validate opportunistically whenever a matching unit appears).
@@ -174,7 +174,7 @@ strategy (R3):
 | UVC access | OSS `UVCCamera` (libuvc) behind facade | kernel uvcvideo / libuvc / MediaFoundation |
 | WiFi-JPEG | **BoliU UDP 8800/1234 client (validated)**; Beken 7080 FSM as fallback module | Rust crate (same protocol modules) |
 | G-sensor | optional: TCP 2271 parser (Beken only) / phone sensors | optional; same |
-| Decode | libuvc→NV21 + `BitmapFactory`/jpeg-turbo; **WiFi: jhdr_Q100 + pages + EOI → stock JPEG** | ffmpeg (libjpeg-turbo inside) |
+| Decode | libuvc→NV21 + `BitmapFactory`/jpeg-turbo; **WiFi: jhdr_Q<q> + pages + EOI → stock JPEG** | ffmpeg (libjpeg-turbo inside) |
 | Encode | MediaCodec H264 15 fps, AAC 64k/44.1k mic → MediaMuxer MP4 | ffmpeg vaapi/nvenc/h264 + aac → MP4 |
 | Rotation | GL shader rotation-uniform (attitude source = device TCP packets or phone sensors or manual) | GL/Qt painter |
 | Capture | frame JPEG passthrough → MediaStore; system share | file save; normal FS |
@@ -193,7 +193,7 @@ strategy (R3):
 - The 11 extra bytes on every first fragment — purpose unknown; ignored safely by the validated recipe.
 - `sendSexCmd`/`sendHBCmd` control bytes (type-86 family) — bytecode-built at runtime; only relevant
   if such a unit is ever driven.
-- Quality control (`setQPara`, Q5..Q100 header table): never exercised by the app, no live effect
+- Quality control (`setQPara`): never exercised by the app, no live effect; the device self-varies quality per frame (25/50/75) and the client must select the matching embedded head (605 B; §10b.6, corrected 2026-10-24)
   observed; treat device quality as fixed per family (profile table in §2.2).
 - armeabi-v7a payload of the vendor — new build can and should be **arm64-first**.
 - Controller zoo: the delivered unit is BoliU *this-firmware*; the Beken driver cannot be live-verified

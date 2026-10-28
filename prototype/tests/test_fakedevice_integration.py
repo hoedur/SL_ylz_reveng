@@ -3,14 +3,16 @@
 Spec source: docs/ARCHITECTURE.md ONLY (REQ-TEST-001). Cites:
 - REQ-ARCH-001/004/005 (transport ABC seam, network only after start(), bounded frame queue)
 - REQ-BOL-002 (90 ms ping EF 00 04 00), REQ-BOL-003/004 (byte layout of §5 fake datagrams)
-- REQ-BOL-005 (reassembly, jpeg = jhdr_Q100 + pages + FF D9), REQ-BOL-007 (stop ≤ 2 s, no events after)
+- REQ-BOL-005 (per-frame head selection, jpeg = header_for(q)|sticky + pages + FF D9), REQ-BOL-007 (stop ≤ 2 s, no events after)
 - REQ-TEL-002/003/004 (store counters, snapshot, pings_tx)
 - §5 (reference fake: ephemeral port, one frame per datagram, heartbeat 1.6 s ± 0.8 s, sticky)
 
 NOTE (resolved, docs/coordination.md): REQ-BOL-001's source-port filter is now defined against
 a `stream_port` constructor parameter (default 1234 for the real-device flow); §5 item 5 pins
 `stream_port=fake.port` for the ephemeral fake — asserted by the e2e below. jpeg length follows
-the spec formula jpeg_size(payload) = 607 + payload + 2 (2709 for the default size-2100 frame).
+the spec formula jpeg_size(payload) = 605 + payload + 2 (2707 for the default size-2100 frame).
+Amended (2026-10-24, REQ-BOL-005/006): the §5 fake pins q=0x4B (=75), so reconstruction uses
+the packaged data/jhdr_Q75.bin head (605 B) — first 605 bytes of every fake-reconstructed JPEG.
 """
 from __future__ import annotations
 
@@ -26,41 +28,45 @@ from otoscope_proto.device.boliu import BoliUTransport
 from otoscope_proto.telemetry import TelemetryStore
 
 PROTOTYPE_DIR = Path(__file__).resolve().parents[1]
-JHDR_PATH = PROTOTYPE_DIR / "src" / "otoscope_proto" / "data" / "jhdr_Q100.bin"
+# §5 item 5: the fake announces q=0x4B (=75) -> REQ-BOL-006 selects the Q75 head.
+JHDR_PATH = PROTOTYPE_DIR / "src" / "otoscope_proto" / "data" / "jhdr_Q75.bin"
 
 
 def _read_packaged_header() -> bytes | None:
-    """REQ-BOL-006 packaged header under src/; None while the file does not exist yet."""
+    """REQ-BOL-006 packaged Q75 head under src/; None while the file does not exist yet."""
     if JHDR_PATH.is_file():
         return JHDR_PATH.read_bytes()
     return None
 
 
 def _jpeg_size(payload_len: int) -> int:
-    """REQ-BOL-006 spec formula: jpeg = jhdr_Q100 (607 B) + payload + FF D9 (2 B)."""
-    return 607 + payload_len + 2
+    """REQ-BOL-006 spec formula: jpeg = header_for(q) (605 B) + payload + FF D9 (2 B)."""
+    return 605 + payload_len + 2
 
 
 _FRAME_PAYLOAD = 2100  # §5 item 2 default frame size (cnt=3 -> 1024+1024+52)
-_EXPECTED_JPEG_LEN = _jpeg_size(_FRAME_PAYLOAD)  # 2709 (orchestrator brief said 2611 — wrong)
+_EXPECTED_JPEG_LEN = _jpeg_size(_FRAME_PAYLOAD)  # 2707 (pre-amendment: 2709 — counted the stray tail)
 
 
 def _assert_is_full_fake_jpeg(frame: bytes) -> None:
-    """REQ-BOL-005: jpeg_len == jpeg_size(2100) == 607+2100+2 == 2709 and correct payload/tail.
+    """REQ-BOL-005: jpeg_len == jpeg_size(2100) == 605+2100+2 == 2707 and correct payload/tail.
 
     The §5 payload bytes ([i % 251 ...]) and the FF D9 tail are asserted unconditionally;
-    the first-607-bytes byte-identity (REQ-BOL-006) fires automatically now that the
-    packaged src/otoscope_proto/data/jhdr_Q100.bin exists (607 B).
+    the first-605-bytes byte-identity (REQ-BOL-006, amended) fires automatically now that
+    the packaged data/jhdr_Q75.bin exists (605 B; §5 pins q=0x4B).
     """
     assert len(frame) == _EXPECTED_JPEG_LEN, (
-        f"REQ-BOL-005/REQ-BOL-006: jpeg_len must be jpeg_size(2100)=2709, got {len(frame)}"
+        f"REQ-BOL-005/REQ-BOL-006: jpeg_len must be jpeg_size(2100)=2707, got {len(frame)}"
     )
     assert frame[-2:] == b"\xff\xd9", "REQ-BOL-005: reconstructed JPEG must end with FF D9"
-    assert frame[607:-2] == payload_bytes(2100), "REQ-§5: payload must be [i%251 for ...]"
+    assert frame[605:-2] == payload_bytes(2100), "REQ-§5: payload must be [i%251 for ...]"
     hdr = _read_packaged_header()
     if hdr is not None:
-        assert len(hdr) == 607
-        assert frame[:607] == hdr, "REQ-BOL-006: first 607 bytes must equal data/jhdr_Q100.bin"
+        assert len(hdr) == 605
+        assert frame[:605] == hdr, (
+            "REQ-BOL-006 (amended): first 605 bytes must equal data/jhdr_Q75.bin "
+            "(the §5 fake announces q=0x4B)"
+        )
 
 
 def _recv_frame_fragments(sock: socket.socket, *, want: int = 3, timeout: float = 2.0) -> list[bytes]:
@@ -107,7 +113,7 @@ def test_fake_device_reference_behavior() -> None:
         sizes = [struct.unpack("<I", f[40:44])[0] for f in frags]
         assert fids == [1, 1, 1], "§5 item 2: first frame_id must be 1"
         assert idxs == [0, 1, 2] and set(cnts) == {3} and set(sizes) == {2100}
-        page0 = frags[0][67:]
+        page0 = frags[0][56:1080]  # amended REQ-BOL-004: d[56:len-11]; 11-B tail excluded
         page1 = frags[1][56:]
         page2 = frags[2][56:]
         assert (len(page0), len(page1), len(page2)) == (1024, 1024, 52)

@@ -156,3 +156,157 @@ Append questions/answers below. Format:
   implementation mismatches found — no [OPEN] items from my side.
 
 - [ANSWERED] test-telemetry: my files corrected per the orchestrator verdict (2026-10-24). (1) `test_frame_queue_drop_oldest_emits_frame_dropped` now expects the FIFO head after 70 pushes into the cap-64 queue to be "frame-6" (= total - QUEUE_MAXSIZE, the 7th pushed item), matching spec-correct drop-oldest; `len(popped)==64` and the 6 `frame_dropped` events unchanged. (2) REQ-TEL-004 coverage extended per the amended spec: `frames_complete` via add_event(kind="frame_complete"), `decode_failed` via add_event(kind="decode_error"), datagram_len>0 bumps datagrams_rx/bytes_rx (now including a "ping" event, i.e. own sent bytes); new tests for `TelemetryStore.mark_decode` (§6 signature matched exactly, no OPEN needed): mark_decode(True) increments decode_ok and ONLY decode_ok (decode_failed/frames_complete/pings_tx/datagrams_rx/bytes_rx/by_kind untouched), and mark_decode does NOT touch decode_failed (True or False). In-file skip/comment locks from the previously under-specified mapping removed; both earlier test-telemetry OPEN entries marked [RESOLVED]. Result: tests/test_telemetry.py + tests/test_arch_isolation.py = 25 passed, src untouched, no remaining callers/opens from me.
+
+## 2026-10-24 — orchestrator: REQ-BOL-005/006 AMENDED (JPEG header per frame, 605 B)
+
+Root cause found while the user reported "washed-out grey video and choppy stream"
+in the live prototype run. Analysis (archived under `analysis/artifacts/decoded/`,
+disassembly `analysis/artifacts/bl.asm` / `libbl_vii_jni.so`):
+
+1. **Extraction bug (the old "607 B" fact was wrong).** The six embedded
+   `jpeg_header_640x360_Q…` symbols sit at a 605-byte stride (0x4c1a, 0x4e77,
+   0x50d4, 0x5331, 0x558e, 0x57eb). The upstream extraction copied 607 bytes per
+   head, so every `analysis/artifacts/jhdr_Q*.bin` carries a 2-byte stray tail
+   (the next head/pool's bytes — literal `FF D8` for Q5..Q75, `5D 02` for Q100).
+   Consequences: Q5..Q75 fail with "broken data stream" (the `FF D8` tail is an
+   invalid entropy-stream marker); Q100 "decodes" but with a 2-byte-shifted
+   entropy stream → tiny dequantized coefficients → the washed-out grey look.
+
+2. **Native selection rule (disassembly, `handle_mcu_msg_frag` @0x267e..0x2698).**
+   The announced quality byte (low byte of the u16 at offset 48) is compared
+   against 5/100/25/50/75/10 and the matching embedded head is selected; no
+   match → no new head (sticky previous head). The announced byte is the
+   **encoder's actual quality**: live trace shows per-frame q = 25/50/75.
+
+3. **Amended spec.** REQ-BOL-005/006 + REQ-TEST-004 + REQ-OPS-004 + §3 tree were
+   amended in `docs/ARCHITECTURE.md`: six **605 B** heads as package data files
+   (`src/otoscope_proto/data/jhdr_Q{5,10,25,50,75,100}.bin`, extracted fresh from
+   the .so; SHA-256s in README), reconstruction = `header_for(low byte of q) +
+   Σ pages + FF D9`, unknown q → sticky previous head, initial fallback
+   `jhdr_Q100.bin`. JPEG length changes by −2 vs the old pinned numbers:
+   `jpeg_size(p) = 605 + p + 2` → artifact case 14 666 (old pinned 14 668),
+   fake-device case **2707** (old pinned 2709).
+
+4. Tests updated by the orchestrator under this amendment (the tester-agents'
+   spec-only pass was executed against the pre-amendment spec): test_jpeg_frames.py
+   (six-head table, byte-identity vs artifacts[:605], artifact case with the
+   Q25 head per frame0's announced q=25), test_reassembly.py (605/2707 numbers;
+   two new tests pinning quality-byte selection → Q75 head and the sticky rule),
+   test_fakedevice_integration.py (§5 fake pins q=0x4B → first 605 bytes ==
+   `data/jhdr_Q75.bin`, 2707). Full suite: **72 passed, 0 failed** (QT_QPA_PLATFORM=offscreen).
+
+5. **Still open (live-awaited):** visual A/B of the corrected pipeline against the
+   original app needs the device ON (it was powered off during this analysis).
+   Choppy-stream diagnosis likewise needs a live capture while the ORIGINAL APP
+   streams (its ping cadence / batch behavior on the wire is unmeasured — existing
+   captures only contain idle heartbeats + our own probes).
+
+## Amendment 2026-10-26 — REQ-BOL-008 (report mode), from the original-app capture
+
+**Basis** (analysis, no hardware regression): monitor-mode capture of the ORIGINAL
+app streaming (`analysis/artifacts/app_stream_2026-10-26/`, doc-04 §9.5, arc42
+§10b.10). The app streams at **≈14.1 fps sustained** (1119 fids over 79.4 s) while
+our ping-only client gets ~3.9 fps (§9.2 cadence sweep — fps NOT ping-gated). On the
+wire the app sends **no `EF 00 04 00`**: it sends `[EF][02][len][body]`
+receive-progress reports (~8.8/s; `fid` = last fully received frame; per-record
+fragment bitmasks for in-flight frames; body magic `02 02 00 01`, const
+`0a 4b 14 2d`; `len16` counts the whole datagram) and `[EF][08][08 00][u32]`
+keepalive every 1.64 s whose u32 counts stream seconds — mirrored by the device
+heartbeat `seq`. Device-side: per-frame last page is a short datagram (78–345 B
+reminders) — already handled by REQ-BOL-004 arithmetic.
+
+**New spec:** REQ-BOL-008 in `docs/ARCHITECTURE.md` — `BoliUReportTransport`
+mentions *ack-gating hypothesis H-1 (live test pending)*: EF-02 report cadence
+(≈9 Hz) is the suspected pacing lever; mode exists to sweep report rate
+(3/9/30 Hz) against fps once the device slot is free.
+
+**Test plan (tests/test_report_mode.py, citing REQ-BOL-008):** exact report
+datagram bytes at fid 0 and after completed frames; byte-exact interval-zero case
+suppressed until first completion? — no: spec says fid=0 until completion, sends
+continue; keepalive byte format + seq initialization from first heartbeat seq;
+heartbeat-driven seq; no `EF 00 04 00` ever sent in report mode; inherited
+reassembly + stop semantics.
+
+## Amendment 2026-10-26 (later) — REQ-BOL-008: no fid-0 reports; EF-00-04 arming is required
+
+**Live falsifications (first report-mode sweep against the real unit):**
+
+1. **Pure report mode (no EF-00-04) is dead**: 3 × 15 s runs at report rates
+   8.9/3.0/30.3 Hz — zero frames, zero heartbeats. The device did not even open a
+   session ⇒ *"any datagram to 8800 re-arms"* (AGENTS.md fact) is WRONG; `EF 00 04 00`
+   arming is required (or at least EF-02 alone does not arm).
+2. **Combined ping + fid-0 report**: session opens (8 heartbeats in 14 s, our
+   keepalive seq initialized from heartbeat seq ≈ 977) but **zero video frames** —
+   reports claiming `fid=0 (state=complete)` while the device is ~977 frames ahead
+   poison/hold the stream.
+   ⇒ Strong support for ACK gating (H-1): the device *does* read the reports.
+
+**Spec amendment:** report sends are silent until the first real frame completes
+(`fid > 0`); tests updated accordingly (`test_report_bytes_at_fid_zero` → "no
+report_ack before first completion"). Ping sweetens nothing else in report mode;
+the combined-mode variant (ping@90 ms + reports) is the live-sweep vehicle.
+
+## Amendment 2026-10-26 (later) — REQ-BOL-009: bootstrap decoded; report mode goes app-exact
+
+**Decisive evidence** (`/tmp/opencode/session_start5.pcapng` — full app restart,
+client-side captured essentially lossless; + the 45 s lossless steady-state tape
+`live_stream_now.pcapng`):
+
+- Session start (t = first video datagram − 0.10 s):
+  `EF 00 04 00` ×2 (0.10 s apart) → `EF 02 28 00` ×2 → continuous reports.
+  **The 4-byte ping IS sent — exactly twice, at bootstrap only, never again.**
+- First video fragment reaches the client **+0.10 s** after the first ping;
+  first record-bearing report **+0.21 s** with `fid=2`.
+- Per-session fid counter starts at **1** (app fresh session: 1..463/29.3 s) —
+  our small fids are correct after all.
+- Report rate sustained **~26.4/s** (778/29.5 s); earlier "8.8/s" was a duty
+  artifact of the lossy capture. Keepalive EF-08 every ~1.3–1.6 s.
+- Lossless steady state: **16.1–16.2 fps** (fid slope), inter-fragment p50
+  0.5 ms, and **720 duplicate (fid,idx) fragments** — real retransmits, so the
+  report fragment bitmasks do trigger device retransmission.
+
+**Spec work**: new REQ-BOL-009 (bootstrap sequence + `report_empty` event +
+`build_empty_report()` + `BOOTSTRAP_PING_GAP_S=0.10`), REQ-BOL-008 interval
+default amended 0.112 → 0.038. Continuous ping loops forbidden in this mode
+(live: ≈3.7 fps cap); pure-report without bootstrap ping → no session at all
+(live). Tests: bootstrap order, exactly-2-pings-lifetime, empty-report bytes +
+event fields, steady-state wire has no ping after first report_ack. Suite 87/87.
+
+## Amendment 2026-10-26 (late) — REQ-BOL-010: SOF0 dims patch; "bogus 480" corrected; artifact attribution revised
+
+**Trigger**: user-reported stripes/color-shift + adversarial validation round (5 agents,
+gate FAILED 3/5 — conclusion rescope). Decisive new facts:
+
+- Native `libbl_vii_jni.so` helper @0x2640 patches the head copy's **SOF0 dims per frame**
+  from the wire (caller stashes h=d[46]→slot[158], w=d[44]→slot[156] @0x240c/0x2414;
+  helper reads them @0x26c8/0x26d2 and writes BE16 into head+145/147 @0x26dc/0x26e4).
+- **The wire's h=480 is the REAL raster height** (1 061/1 061 frag0 datagrams in both
+  tapes announce w=640, h=480). Canvas-480 decode reproduces the app's full render
+  (incl. the bottom 120 rows); top-360 rows are pixel-identical under both canvases;
+  the pre-EOI "surplus entropy" (~6.4–11.2 kB, earlier called live-only) is the
+  bottom-raster rows' encoded data the 360-canvas head could not consume
+  (fid 2080: 8374 → 3 extraneous bytes). P fixes: REQ-BOL-010.
+- **User-visible top-left stripes exist in the device's own stream** (7/10 complete
+  app-session tape frames show a foreign-palette top band; 2080/2303/2153 strongly
+  match OTHER frames' content). Attribution: device-side encoder content at scan
+  start — NOT a reassembly bug, NOT our delivery regime. The native machine has an
+  additional exposure the prototype lacks: its completion scan never tests page-0's
+  bit and recycles ring slots (fid−4) without clearing buffers → a page0-loss frame
+  completes with stale slot content in the APP (prototype drops such frames instead).
+- Empirical instrument correction: **PIL (venv Pillow 13) swallows libjpeg
+  warnings** — "decode clean / no warnings" findings must be re-checked with `djpeg`.
+
+**Spec work**: REQ-BOL-010 (assemble_jpeg gets width/height kwargs, `_collect` passes
+entry.w/entry.h); REQ-BOL-005 wording unchanged (h is a real field, not bogus).
+Tests to add: patch function byte-exactness (Q25 head + (640,480) → `01 e0 02 80` at
+145..149), no-patch default, transport pop delivers announced dims.
+
+## Amendment 2026-10-27 — REQ-BOL-004: frag0 wire-exact layout (gate-1 validator, adversarial round 0)
+
+Disassembly-driven correction (native block `0x26e8–0x2702` in `libbl_vii_jni.so`, exhaustive store sweep over `0x230c–0x2760`): **frag0's "11 extra bytes" are TRAILING, not leading.** Every fragment's header is 56 B; frag0 datagrams append 11 trailing ASCII metadata bytes at `d[len-11:len]` (e.g. `-0214,-0894`; natively stashed at `slot+0x1000a4..0x1000af`, ring slot stride `0x1000b0`). The previously documented `page0 = d[67:]` slice (67-B frag0 header) shifted the entropy stream by 11 B — the "3 extraneous bytes on fid 2080"/"premature end" residual-warnings and much of the top-band artifact attribution were artifacts of that slice.
+
+- REQ-BOL-004 text amended (page0 = `d[56:len-11]`, `cnt==1` → `size-11` B; framing totals unchanged: frag0 datagrams stay 1091 B).
+- Code: `boliu.py` `FRAG0_HDR=67` removed → `FRAG_HDR=56` + `FRAG0_TAIL=11`, slice updated; `fake_device.py` + all four test `fragment()` builders emit the wire-exact layout; `test_fakedevice_integration` page0 slice updated. Suite: 96/96 after the change.
+- Offline tape re-verification (corrected recipe): see `analysis/artifacts/frag0_layout_2026-10-27/` (per-frame djpeg warnings old-vs-new slice at 640×480; top-band metrics old-vs-new).
+- OPEN items: (1) the 11-B tail's meaning — ASCII sensor-value-like strings (candidate link to the open heartbeat "drift word" question; would give the wire a sensor channel — arc42 §10b previously recorded "no sensor channel on this unit" and that needs a re-check / candidate REQ-BOL-011 to surface `tail` in an event field); (2) `cnt==1` frag0-tail arithmetic is derived, not live-validated (no cnt==1 frame in any tape); (3) page0-tail behavior at `size < 1024` mid-frames not yet observed.
+- Note: the 7 short `[0x93][01]` control datagrams (58–67 B, body `02 02 00 01` + fid-triple, no fragment fields) documented by the same recounted tapes are NOT fragments and stay out of REQ-BOL-004 parsing (they hit `malformed`/too-short paths).

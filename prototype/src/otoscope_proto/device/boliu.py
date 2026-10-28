@@ -7,12 +7,15 @@ Empirical basis: ``analysis/01-arc42-architecture.md`` §10b /
 Wire summary (all offsets into the received datagram ``d``):
 - framing ``[0x93][01|04][len LE16]``; ``len16`` must equal ``len(d)``;
 - fragment (``d[1]==1``): ``frame_id`` LE32 @8, ``idx`` LE32 @32, ``cnt`` LE32 @36,
-  ``size`` LE32 @40, ``w``/``h``/``q`` LE16 @44/46/48; page data at ``d[67:]`` for
-  ``idx==0`` (frag0 header is 67 B) else ``d[56:]``;
+  ``size`` LE32 @40, ``w``/``h``/``q`` LE16 @44/46/48; page data at ``d[56 : len-11]`` for
+  ``idx==0`` (frag0 carries 11 trailing ASCII metadata bytes; every header is 56 B) else
+  ``d[56:]``;
 - heartbeat (``d[1]==4``, total length 16): ``seq`` LE32 @4, ``pad`` @8, ``drift`` @12;
 - ping every 90 ms: ``EF 00 04 00`` to ``host:port`` (default 8800);
 - reassembly keyed ``(frame_id, size)``, complete at first ``cnt`` indices,
-  >16 pending keys pruned oldest-first; reconstructed JPEG pushed via the store.
+  >16 pending keys pruned oldest-first; JPEG header picked per frame from the
+  announced quality byte (low byte of ``q``, amended REQ-BOL-005/006);
+  reconstructed JPEG pushed via the store.
 
 Standard library only; no JPEG decoding here (the UI owns that).
 """
@@ -26,11 +29,11 @@ import time
 from collections import OrderedDict
 from typing import Any
 
-from ..jpeg_frames import DEFAULT_HEADER, assemble_jpeg
+from ..jpeg_frames import DEFAULT_HEADER, JPEG_HEADER_TABLE, assemble_jpeg
 from ..telemetry import TelemetryEvent
 from . import DeviceTransport
 
-__all__ = ["BoliUTransport"]
+__all__ = ["BoliUReportTransport", "BoliUTransport"]
 
 
 class _PendingFrame:
@@ -51,7 +54,11 @@ class BoliUTransport(DeviceTransport):
 
     Binds ``0.0.0.0:<local_port>`` (ephemeral by default), pings
     ``host:port`` every 90 ms and receives fragmented video from the device's
-    port 1234 (REQ-BOL-001). All observations flow into the shared
+    port 1234 (REQ-BOL-001). The reconstruction header is selected per frame
+    from the announced quality byte (amended REQ-BOL-005/006): the low byte
+    of ``q`` keys ``JPEG_HEADER_TABLE``, an unknown level keeps the last
+    selected head (initially ``DEFAULT_HEADER``), mirroring the native
+    ``handle_mcu_msg_frag`` selection. All observations flow into the shared
     :class:`~otoscope_proto.telemetry.TelemetryStore`.
     """
 
@@ -66,8 +73,8 @@ class BoliUTransport(DeviceTransport):
     MAX_PENDING_KEYS = 16  # REQ-BOL-005
     MAX_CNT = 3408  # REQ-BOL-004 sanity: 0 < cnt <= 3408
     MAX_PAGE = 1024  # REQ-BOL-004 sanity: page length <= 1024
-    FRAG0_HDR = 67  # frag0 header length (incl. 11 extra bytes)
-    FRAG_HDR = 56  # mid/last fragment header length
+    FRAG_HDR = 56  # every fragment's header length (REQ-BOL-004, wire-exact)
+    FRAG0_TAIL = 11  # frag0-only trailing ASCII metadata, d[len-11:len] (amended REQ-BOL-004
     HEARTBEAT_LEN = 16  # REQ-BOL-003
 
     def __init__(
@@ -86,6 +93,8 @@ class BoliUTransport(DeviceTransport):
         self._ping_thread: threading.Thread | None = None
         self._recv_thread: threading.Thread | None = None
         self._pending: OrderedDict[tuple[int, int], _PendingFrame] = OrderedDict()
+        self._last_head: bytes | None = None  # amended REQ-BOL-005/006: sticky
+        self._last_completed_frame_id = 0  # most recent fully reassembled frame
 
     # -- lifecycle (REQ-ARCH-004) ------------------------------------------
 
@@ -251,7 +260,9 @@ class BoliUTransport(DeviceTransport):
         if size <= 0:
             self._malformed(addr_s, d, {"reason": "size_range", "size": size})
             return
-        page = d[self.FRAG0_HDR if idx == 0 else self.FRAG_HDR :]
+        # Amended REQ-BOL-004 (gate-1, 2026-10-27): frag0's page excludes the 11
+        # trailing ASCII metadata bytes; mid/last pages have no tail.
+        page = d[self.FRAG_HDR : len(d) - (self.FRAG0_TAIL if idx == 0 else 0)]
         page_len = len(page)
         if page_len <= 0 or page_len > self.MAX_PAGE:
             self._malformed(
@@ -276,7 +287,10 @@ class BoliUTransport(DeviceTransport):
     @staticmethod
     def _expected_page_len(idx: int, cnt: int, size: int) -> int:
         """Expected page length (REQ-BOL-004 mid/last arithmetic); the single-
-        fragment frame (cnt == 1, idx == 0) is its own last page: ``size``."""
+        fragment frame (cnt == 1, idx == 0) is its own last page: ``size``,
+        with frag0's 11-byte trailing metadata sitting past the page end
+        (derived from the amended REQ-BOL-004 layout; no cnt==1 frame observed
+        live yet — verify on first occurrence)."""
         if idx == cnt - 1:
             return size - (cnt - 1) * 1024
         return 1024
@@ -306,7 +320,16 @@ class BoliUTransport(DeviceTransport):
         if len(entry.pages) < entry.cnt:
             return
         payload = b"".join(entry.pages[i] for i in range(entry.cnt))
-        jpeg = assemble_jpeg(DEFAULT_HEADER, payload)
+        # Amended REQ-BOL-005/006: pick the head matching the announced
+        # quality byte (low byte of q). Unknown level -> sticky previous head
+        # (initial DEFAULT_HEADER), like the native handle_mcu_msg_frag path.
+        head = JPEG_HEADER_TABLE.header_for(q & 0xFF)
+        if head is None:
+            head = self._last_head or DEFAULT_HEADER
+        else:
+            self._last_head = head
+        jpeg = assemble_jpeg(head, payload, width=entry.w, height=entry.h)
+        self._last_completed_frame_id = frame_id
         del self._pending[key]
         # push first (network thread, REQ-ARCH-005), then the completion event
         self.store.push_frame(jpeg, time.monotonic())
@@ -350,3 +373,216 @@ class BoliUTransport(DeviceTransport):
         self, addr_s: str, d: bytes, fields: dict[str, Any]
     ) -> None:
         self._add_event("malformed", addr_s, len(d), fields, d)
+
+
+class BoliUReportTransport(BoliUTransport):
+    """REQ-BOL-008 + REQ-BOL-009 (2026-10-26): app-exact report mode, mirroring
+    the ORIGINAL app's wire behavior (monitor captures
+    `analysis/artifacts/app_stream_2026-10-26/` + the lossless restart tape,
+    doc-04 §9.5/§9.6, arc42 §10b.10).
+
+    On ``start()`` it runs the REQ-BOL-009 **bootstrap**: two ``EF 00 04 00``
+    pings ~100 ms apart (the device arms the session and starts streaming
+    ~0.10 s after the first ping — pure-report sessions never open), then two
+    40 B empty reports (``EF 02 28 00``, record count 0). After that **no
+    further pings are ever sent** (a continuous ping loop caps delivery at
+    ≈3.7 fps, live-falsified); the steady state sends to ``host:port``:
+
+    - receive-progress report every ``report_interval`` s (default 0.038 ≈ the
+      app's sustained ~26.4 reports/s): ``EF 02 40 00`` + magic ``02 02 00 01``,
+      record count 1, constant ``0A 4B 14 2D`` at datagram offset 24, ``fid``
+      LE32 (most recently completed frame), state 1, record size ``0x18`` and
+      the FF×8 fragment bitmask; 64 B total (``len16`` counts the whole
+      datagram). Reports stay silent until the first frame completes
+      (fid-0 reports poison the stream — live-verified).
+    - stream keepalive every 1.64 s: ``EF 08 08 00`` + LE32 counter tracking
+      the device heartbeat ``seq`` (the heartbeat mirrors stream age).
+
+    Parsing/reassembly/lifecycle are inherited unchanged (REQ-BOL-001..007).
+    """
+
+    name = "boliu-report"
+
+    REPORT_INTERVAL_S = 0.038  # REQ-BOL-008 (≈ app's 26.4 reports/s, lossless capture)
+    KEEPALIVE_INTERVAL_S = 1.64  # REQ-BOL-008 (device heartbeat cadence)
+    REPORT_BODY_CONST = bytes.fromhex("0A4B142D")
+    REPORT_MAGIC = bytes.fromhex("02020001")
+    BOOTSTRAP_PING_GAP_S = 0.10  # REQ-BOL-009 (app: 2nd ping +0.10 s after the 1st)
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        store: Any,
+        local_port: int = 0,
+        stream_port: int = 1234,
+        report_interval: float | None = None,
+        keepalive_interval: float | None = None,
+    ) -> None:
+        super().__init__(host, port, store, local_port=local_port, stream_port=stream_port)
+        self._report_interval = (
+            self.REPORT_INTERVAL_S if report_interval is None else float(report_interval)
+        )
+        self._keepalive_interval = (
+            self.KEEPALIVE_INTERVAL_S
+            if keepalive_interval is None
+            else float(keepalive_interval)
+        )
+        self._keepalive_seq = 0
+        self._report_thread: threading.Thread | None = None
+        self._keepalive_thread: threading.Thread | None = None
+
+    # -- sandbox override: report mode never runs the continuous ping loop
+    #    (REQ-BOL-009: the only pings are the two bootstrap pings) -----------
+
+    def _ping_loop(self) -> None:  # REQ-BOL-008/009: no continuous EF 00 04 00
+        while not self._stop_flag.is_set():
+            if self._stop_flag.wait(self.PING_INTERVAL_S):
+                return
+
+    # -- datagram builders (pure, testable) ---------------------------------
+
+    def build_empty_report(self) -> bytes:
+        """40 B ``EF 02 28 00`` empty report, record count 0 (REQ-BOL-009).
+
+        Byte layout from the app-restart tape: header + magic + count=0 +
+        12 zero bytes + const at offset 24 + 12 zero bytes (8 B tail area).
+        """
+        d = bytearray(40)
+        d[0:4] = b"\xEF\x02\x28\x00"
+        d[4:8] = self.REPORT_MAGIC
+        struct.pack_into("<I", d, 8, 0)  # record count 0
+        d[24:28] = self.REPORT_BODY_CONST
+        # everything else stays 0
+        return bytes(d)
+
+    def build_report(self, fid: int) -> bytes:
+        """64 B ``EF 02 40 00`` receive-progress report (REQ-BOL-008).
+
+        Layout from the original-app capture (artifacts/app_stream_2026-10-26),
+        identical for the 88/104 B variants: const ``0A 4B 14 2D`` sits at
+        body offset 20 (datagram offset 24), records start at datagram
+        offset 32, 8-byte zero trailer at the end.
+        """
+        d = bytearray(64)
+        d[0:4] = b"\xEF\x02\x40\x00"
+        d[4:8] = self.REPORT_MAGIC
+        struct.pack_into("<I", d, 8, 1)  # one record
+        d[24:28] = self.REPORT_BODY_CONST  # position per capture (was wrongly 28)
+        struct.pack_into("<I", d, 32, fid & 0xFFFFFFFF)  # fid u64 low word
+        # d[12:24], d[28:32], d[36:40] stay 0
+        struct.pack_into("<I", d, 40, 1)  # state: complete
+        struct.pack_into("<I", d, 44, 0x18)  # record size field per capture
+        d[48:56] = b"\xFF" * 8  # fragment bitmask: everything received
+        # d[56:64] zero trailer
+        return bytes(d)
+
+    def build_keepalive(self, seq: int) -> bytes:
+        """8 B ``EF 08 08 00`` stream keepalive (REQ-BOL-008)."""
+        return b"\xEF\x08\x08\x00" + struct.pack("<I", seq & 0xFFFFFFFF)
+
+    # -- worker threads -----------------------------------------------------
+
+    def start(self) -> None:
+        super().start()
+        if self._report_thread is None:
+            self._report_thread = threading.Thread(
+                target=self._report_loop, name=f"{self.name}-report", daemon=True
+            )
+            self._report_thread.start()
+        if self._keepalive_thread is None:
+            self._keepalive_thread = threading.Thread(
+                target=self._keepalive_loop, name=f"{self.name}-ka", daemon=True
+            )
+            self._keepalive_thread.start()
+
+    def stop(self) -> None:
+        super().stop()
+        for thread in (self._report_thread, self._keepalive_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=self.STOP_JOIN_TIMEOUT_S)
+        self._report_thread = self._keepalive_thread = None
+
+    def _bootstrap(self) -> bool:
+        """REQ-BOL-009: 2× ``EF 00 04 00`` ping, then 2× empty report.
+
+        Mirrors the app-restart tape exactly: first ping at +0.00 s, second at
+        +0.10 s, empty reports right after (the device's first video fragment
+        arrived +0.10 s after the first ping, the app's first record-bearing
+        report +0.21 s). Returns False if stopped or the socket died.
+        """
+        sock = self._sock
+        if sock is None:
+            return False
+        for _ in range(2):
+            try:
+                sock.sendto(self.PING_PAYLOAD, (self.host, self.port))
+            except OSError:
+                return False
+            self._add_event("ping", f"{self.host}:{self.port}",
+                            len(self.PING_PAYLOAD),
+                            {"bytes": self.PING_FIELD_HEX}, self.PING_PAYLOAD)
+            if self._stop_flag.wait(self.BOOTSTRAP_PING_GAP_S):
+                return False
+            sock = self._sock
+            if sock is None:
+                return False
+        payload = self.build_empty_report()
+        for _ in range(2):
+            try:
+                sock.sendto(payload, (self.host, self.port))
+            except OSError:
+                return False
+            self._add_event("report_empty", f"{self.host}:{self.port}",
+                            len(payload), {"nrec": 0}, payload)
+        return True
+
+    def _report_loop(self) -> None:
+        # REQ-BOL-009: bootstrap before any steady-state traffic.
+        if not self._bootstrap():
+            return
+        while not self._stop_flag.is_set():
+            if self._stop_flag.wait(self._report_interval):
+                return
+            sock = self._sock
+            if sock is None:
+                return
+            fid = self._last_completed_frame_id
+            if fid == 0:
+                # REQ-BOL-008 amendment (live-verified): a report claiming fid 0
+                # (= "frame 0 complete") while the device is far ahead pauses
+                # delivery entirely — falsified fid-0 reports poison the stream.
+                # Stay silent until the first real completion.
+                continue
+            payload = self.build_report(fid)
+            try:
+                sock.sendto(payload, (self.host, self.port))
+            except OSError:
+                return
+            self._add_event("report_ack", f"{self.host}:{self.port}", len(payload),
+                            {"fid": fid}, payload)
+
+    def _keepalive_loop(self) -> None:
+        while not self._stop_flag.is_set():
+            if self._stop_flag.wait(self._keepalive_interval):
+                return
+            sock = self._sock
+            if sock is None:
+                return
+            payload = self.build_keepalive(self._keepalive_seq)
+            try:
+                sock.sendto(payload, (self.host, self.port))
+            except OSError:
+                return
+            self._add_event("keepalive_tx", f"{self.host}:{self.port}", len(payload),
+                            {"seq": self._keepalive_seq}, payload)
+            self._keepalive_seq += 1
+
+    def _handle_heartbeat(self, d: bytes, addr_s: str) -> None:
+        super()._handle_heartbeat(d, addr_s)
+        # REQ-BOL-008: track stream age — the heartbeat seq mirrors the
+        # client-side stream-seconds counter of the original app.
+        if len(d) == self.HEARTBEAT_LEN:
+            (seq,) = struct.unpack_from("<I", d, 4)
+            if seq > self._keepalive_seq:
+                self._keepalive_seq = seq

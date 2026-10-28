@@ -8,11 +8,18 @@ Frames are hand-crafted from the REQ-BOL-004 byte layout (see
 - pending keys > 16 -> oldest pruned with a ``frame_dropped`` event
   (``fields={"pruned": True}``),
 - on completion: one ``frame_complete`` event (fields frame_id, size, cnt, w, h, q)
-  and one frame pushed to the queue = ``jhdr_Q100 (607 B) + concat(pages IN INDEX
-  ORDER) + FF D9`` (length 607 + size + 2).
+  and one frame pushed to the queue = ``header_for(q byte) + concat(pages IN INDEX
+  ORDER) + FF D9`` (length 605 + size + 2).
 
 Frames use the spec's fake-device size 2100 -> cnt = 3 -> pages 1024/1024/52
 (spec §5); page payloads are deterministic tags, deliberately NOT JPEG-decodable.
+
+Amendment 2026-10-24 (REQ-BOL-005/006): the reconstruction header is picked per
+frame from the announced quality byte (low byte of ``q``). The datagrams below
+use ``q = 0x4D (77)`` — a quality the head table does not know — so the sticky
+rule applies and the reconstruction uses the **initial fallback head**,
+``data/jhdr_Q100.bin`` (605 B). Dedicated tests below pin the per-quality
+selection itself.
 """
 
 import socket
@@ -23,11 +30,11 @@ from pathlib import Path
 import pytest
 
 from otoscope_proto.device.boliu import BoliUTransport
-from otoscope_proto.jpeg_frames import jpeg_size
+from otoscope_proto.jpeg_frames import jpeg_size, patch_sof0_dims
 from otoscope_proto.telemetry import TelemetryStore
 
-JHDR_PATH = Path(__file__).resolve().parents[2] / "analysis" / "artifacts" / "jhdr_Q100.bin"
-JHDR = JHDR_PATH.read_bytes()  # REQ-BOL-005/006: the 607 B reconstruction header
+JHDR_PATH = Path(__file__).resolve().parents[1] / "src" / "otoscope_proto" / "data" / "jhdr_Q100.bin"
+JHDR = JHDR_PATH.read_bytes()  # amended REQ-BOL-005/006: the initial fallback head (605 B)
 
 SIZE = 2100  # spec §5 pressure-test size
 CNT = 3
@@ -35,14 +42,21 @@ PAGES = [1024, 1024, SIZE - (CNT - 1) * 1024]  # 1024 / 1024 / 52
 W, H, Q = 640, 444, 77
 DEVICE_SRC_IP, DEVICE_SRC_PORT = "127.0.0.1", 1234
 
+# amended REQ-BOL-004 (gate-1): frag0's trailing ASCII metadata on the wire
+# (example bytes observed at d[len-11:len]; stashed natively, not page data)
+FRAG0_TAIL = b"-0214,-0894"
+
 
 def mkpage(tag: int, length: int) -> bytes:
     return bytes((tag * 31 + 7 * i) % 251 for i in range(length))
 
 
 def fragment(frame_id, idx, cnt, size, page, *, w=W, h=H, q=Q, dup=0):
-    head = 67 if idx == 0 else 56
-    d = bytearray(head + len(page))
+    head = 56
+    # amended REQ-BOL-004 (gate-1): every header is 56 B; frag0 appends 11
+    # trailing ASCII metadata bytes which are NOT page data.
+    tail = FRAG0_TAIL if idx == 0 else b""
+    d = bytearray(head + len(page) + len(tail))
     d[0] = 0x93
     d[1] = 1
     struct.pack_into("<H", d, 2, len(d))
@@ -55,7 +69,9 @@ def fragment(frame_id, idx, cnt, size, page, *, w=W, h=H, q=Q, dup=0):
     struct.pack_into("<H", d, 44, w)
     struct.pack_into("<H", d, 46, h)
     struct.pack_into("<H", d, 48, q)
-    d[head:] = page
+    d[head : head + len(page)] = page
+    if tail:
+        d[len(d) - len(tail) :] = tail
     return bytes(d)
 
 
@@ -67,8 +83,11 @@ def frame_datagrams(frame_id, payload_tag, cnt=CNT, size=SIZE):
 
 
 def reconstructed(pages):
-    # REQ-BOL-005 + REQ-BOL-006: jhdr + pages in index order + FF D9
-    return JHDR + b"".join(pages) + b"\xff\xd9"
+    # Amended REQ-BOL-005/006: initial-fallback head (unknown q=77 stays Q100,
+    # 605 B) + pages in index order + FF D9.
+    # REQ-BOL-010: the head bytes shipped to the queue carry the SOF0 dims patch
+    # from the datagram's announced (W, H) — native parity, see test_sof0_dims.
+    return patch_sof0_dims(JHDR, W, H) + b"".join(pages) + b"\xff\xd9"
 
 
 class Collector:
@@ -190,8 +209,8 @@ def assert_complete_fields(ev, frame_id):
 
 @pytest.fixture
 def h():
-    if len(JHDR) != 607:
-        pytest.fail("test vector jhdr_Q100.bin is not 607 B")
+    if len(JHDR) != 605:
+        pytest.fail("test vector data/jhdr_Q100.bin is not 605 B (amended REQ-BOL-006)")
     harness = LoopbackHarness()
     try:
         yield harness
@@ -219,9 +238,9 @@ def test_complete_in_order_frame_produces_event_and_queue_frame(h):
     assert isinstance(ts, float) and ts >= 0
     expected = reconstructed(pages)
     assert jpeg == expected
-    # REQ-BOL-005: length == 607 + size + 2 = 607 + 2100 + 2 = 2709; framing exact
-    assert len(jpeg) == jpeg_size(SIZE) == 607 + SIZE + 2 == 2709
-    assert jpeg[:607] == JHDR
+    # Amended REQ-BOL-005: length == 605 (head) + 2 (EOI) + size = 2707; framing exact
+    assert len(jpeg) == jpeg_size(SIZE) == 605 + SIZE + 2 == 2707
+    assert jpeg[:605] == patch_sof0_dims(JHDR, W, H)  # REQ-BOL-010 dims patch
     assert jpeg[-2:] == b"\xff\xd9"
     h.settle(0.3)
     assert h.pop_frames() == []  # exactly one frame in the queue
@@ -239,8 +258,7 @@ def test_out_of_order_delivery_reassembles_in_index_order(h):
     frames = h.wait_frames(1)
     jpeg, _ts = frames[0]
     # Distinguishable page payloads prove concatenation by INDEX, not arrival:
-    assert jpeg == JHDR + pages[0] + pages[1] + pages[2] + b"\xff\xd9"
-    assert jpeg == reconstructed(pages)
+    assert jpeg == reconstructed(pages)  # REQ-BOL-010: dims-patched fallback head
     assert len(jpeg) == jpeg_size(SIZE)
 
 
@@ -339,3 +357,55 @@ def test_transport_keeps_running_after_malformed_input(h):
     frames = h.wait_frames(1)
     assert frames[0][0] == reconstructed(pages)
     assert len(frames[0][0]) == jpeg_size(SIZE)
+
+
+# ------------------------------------------------------------------ amended REQ-BOL-005/006
+
+
+def _set_u16_field(dgram: bytes, offset: int, value: int) -> bytes:
+    d = bytearray(dgram)
+    struct.pack_into("<H", d, offset, value)
+    return bytes(d)
+
+
+def _head(q: int) -> bytes:
+    p = Path(__file__).resolve().parents[1] / "src" / "otoscope_proto" / "data" / f"jhdr_Q{q}.bin"
+    return p.read_bytes()
+
+
+def test_announced_quality_byte_selects_matching_head(h):
+    # Amended REQ-BOL-005/006: quality byte 75 (0x4B — the §5 fake's pinned value)
+    # must reconstruct with the Q75 head, per native handle_mcu_msg_frag behavior.
+    dgrams, pages = frame_datagrams(frame_id=30, payload_tag=6)
+    dgrams = [_set_u16_field(d, 48, 0x014B) for d in dgrams]  # low byte = 75
+    for d in dgrams:
+        h.send(d)
+    h.col.wait_for(
+        "frame_complete with q=0x014B",
+        lambda e: e.kind == "frame_complete" and e.fields.get("frame_id") == 30,
+    )
+    frames = h.wait_frames(1)
+    jpeg, _ts = frames[0]
+    assert jpeg[:605] == patch_sof0_dims(_head(75), W, H), "quality byte 75 must select the Q75 head (REQ-BOL-010 dims apply)"
+    assert jpeg[605:-2] == b"".join(pages)
+    assert jpeg[-2:] == b"\xff\xd9" and len(jpeg) == jpeg_size(SIZE)
+
+
+def test_unknown_quality_keeps_previous_head_sticky(h):
+    # Amended REQ-BOL-005/006: unknown quality level -> sticky previous head
+    # (native path at libbl 0x2696/0x26e8: unmatched byte keeps the old head).
+    d1, _ = frame_datagrams(frame_id=31, payload_tag=7)
+    d1 = [_set_u16_field(d, 48, 50) for d in d1]  # valid: selects Q50
+    for d in d1:
+        h.send(d)
+    h.col.wait_for("frame1 q50", lambda e: e.kind == "frame_complete" and e.fields.get("frame_id") == 31)
+    h.wait_frames(1)
+
+    d2, _ = frame_datagrams(frame_id=32, payload_tag=8)
+    d2 = [_set_u16_field(d, 48, 129) for d in d2]  # unknown level (byte49 stays 0)
+    for d in d2:
+        h.send(d)
+    h.col.wait_for("frame2 unknown-q", lambda e: e.kind == "frame_complete" and e.fields.get("frame_id") == 32)
+    frames = h.wait_frames(1)  # the second (unknown-q) frame is the only queued one
+    jpeg, _ts = frames[0]
+    assert jpeg[:605] == patch_sof0_dims(_head(50), W, H), "unknown quality must keep the previously selected head (REQ-BOL-010 dims apply)"
