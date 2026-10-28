@@ -34,8 +34,9 @@ class VideoPanel(QWidget):
 
     One black, centered QLabel carries both modes: "No signal — pinging
     <host>:<port>" placeholder text before/without frames, and the decoded
-    pixmap (native 640×360 size, centered on black = letterbox) afterwards.
-    No telemetry is ever drawn here (REQ-UI-002/REQ-TEL-005).
+    pixmap (the decoded canvas's own size — 640×480 live, REQ-BOL-010 — centered
+    on black = letterbox) afterwards. No telemetry is ever drawn here
+    (REQ-UI-002/REQ-TEL-005).
     """
 
     def __init__(self, host: str, port: int, parent: QWidget | None = None) -> None:
@@ -62,8 +63,8 @@ class VideoPanel(QWidget):
         if image.isNull():
             return False  # caller emits decode_error and restores the placeholder
         pixmap = QPixmap.fromImage(image)
-        # Letterbox: keep the 640x360 aspect — display the pixmap at native size
-        # word, shrink-only when it is larger than the pane (KeepAspectRatio).
+        # Letterbox: keep the decoded canvas's own aspect — display the pixmap at native
+        # size, shrink-only when it is larger than the pane (KeepAspectRatio).
         size = self._label.size()
         if (
             size.isValid()

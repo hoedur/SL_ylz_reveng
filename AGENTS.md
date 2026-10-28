@@ -7,7 +7,8 @@ it by name alone). It serves the same role as a `CLAUDE.md` in Claude Code proje
 ## What this project is
 
 Reverse engineering of the Chinese ear-wax-remover otoscope app
-`SL+ylz_V1.0.23.251121_APKPure.xapk` (package `com.xiaozhen.beauty.shenglong`)
+`SL+ylz/V1.0.23.251121/SL+ylz_V1.0.23.251121_APKPure.xapk`
+(package `com.xiaozhen.beauty.shenglong`)
 as the basis for a free/open-source replacement. Phase 1 is **analysis only —
 no implementation code**. Deliverables live in `analysis/`:
 
@@ -18,8 +19,8 @@ no implementation code**. Deliverables live in `analysis/`:
 - `analysis/04-live-device-validation.md` — live-probe evidence and retest log (artifacts under
   `analysis/artifacts/`)
 
-Never modify or delete anything under `unzipped/` (APK artifacts, split configs,
-native `.so` files) — these are read-only source material for the analysis.
+Never modify or delete anything under `SL+ylz/V1.0.23.251121/unzipped/` (APK artifacts,
+split configs, native `.so` files) — these are read-only source material for the analysis.
 
 ## Environment and tooling
 
@@ -32,7 +33,7 @@ native `.so` files) — these are read-only source material for the analysis.
 - androguard 4.x API notes (they cost several debugging rounds; do not re-learn
   them):
   - `AnalyzeDex` works on `.dex` files, not on the `.apk`. Use
-    `unzipped/com.xiaozhen.beauty.shenglong/classes{,2,3}.dex`.
+    `SL+ylz/V1.0.23.251121/unzipped/com.xiaozhen.beauty.shenglong/classes{,2,3}.dex`.
   - `d.get_methods()` on a raw `DEX` returns `MethodIdItem`s (no bytecode).
     Iterate `d.get_classes()` → `c.get_methods()` to get `EncodedMethod`s.
   - String extraction per instruction: `ins.get_string()` (try/except), it only
@@ -63,9 +64,13 @@ empirical from `analysis/04-live-device-validation.md` + `analysis/artifacts/`.
     halted — doc-04 §9.9 C).
   - Device streams fragments from `:1234`: `[0x93][01][len LE16]` + 56-byte header on **every**
     fragment (amended 2026-10-27 gate-1: frag0 carries 11 TRAILING ASCII bytes
-    `d[len-11:len]`, e.g. `-0214,-0894`; page0 = `d[56:1080]`; the "67-byte frag0 header"
-    reading was inverted) + 1024-B page; datagrams ≤1091 B;
-    idx@32, cnt@36, size@40, w=640@44, h=480@46 (REAL raster height); out-of-order → reorder by idx.
+    `d[len-11:len]`, e.g. `-0214,-0894`; page0 = `d[56:len-11]`; the "67-byte frag0 header"
+    reading was inverted) + 1024-B page; datagrams ≤1091 B; **last pages may be short
+    (57..67-B band = remainder under 12 B, valid fragments — 2026-10-28)**;
+    idx@32, cnt@36, size@40, w=640@44, h=480@46 (REAL raster height); frame id=u32@8
+    (monotonic = report fid under the app; cycles {1..3} under ping-only delivery),
+    u16@48 high byte = (id−1) mod 2, u32@24 = previous id (2026-10-28 gate round 2);
+    out-of-order → reorder by idx.
   - **Decode (corrected 2026-10-24, slice corrected 2026-10-27): `jhdr_Q<q>.bin` (605 B heads,
     from `libbl_vii_jni.so`) + Σ pages (`d[56:1080]` for idx0, `d[56:]` otherwise) + `FF D9` →
     stock JPEG, 640×480 RGB with correct colorimetry (head SOF0 patched per frame to d[44]/d[46],
@@ -75,14 +80,20 @@ empirical from `analysis/04-live-device-validation.md` + `analysis/artifacts/`.
     2-byte over-extraction (`analysis/04-live-device-validation.md` §5b-2 root cause); no
     XOR/transform exists (sweeps negative — still true).
   - Delivery under our ping-only client is bursty: ~25 fps intra-burst with ~0.45–0.5 s
-    device-side stalls, ~3–4 fps effective. Heartbeat `[0x93][04][16 B]` every 1.6 s, follows the
+    device-side stalls, ~3–4 fps effective. Heartbeat `[0x93][04][16 B]` every 1.6 s nominal
+    per grid tick (one datagram per tick under any active **client**; with NO ACKing client the
+    device storms byte-identical beats 8–694× at ≈0.4 ms spacing — session_start5's 2410-beat
+    record; seq does not advance within a storm; 2026-10-28 classified), follows the
     streaming socket; drift word `5e xx` is **not** an accelerometer. **Cadence sweep (2026-10-24):
     fps is NOT ping-gated** — pings 90/40/20/10 ms all yield ~3.4–4.0 fps with ~0.49 s stalls; the
-    ping only arms/redirects delivery.
+    ping only arms/redirects delivery. Measured ping-regime fps: 3.43/3.72–3.80 (2026-10-24/27),
+    3.88 (own_session recount), 3.91 (2026-10-28 fresh-boot) — band **3.43–3.91**.
   - **App-capture (2026-10-26, monitor mode; superseded by the lossless §9.6 results below):**
     the app streams at **~16.1–16.2 fps sustained** (fid slope on a lossless 45 s tape; the
     first "14.1 fps" and "8.8 reports/s" were capture-duty artifacts — real report rate is
-    **~26.4/s fresh session, ~39/s long session**). The app **sends `EF 00 04 00` exactly
+    **~26.4/s fresh session, ~39/s long session**; tape #2 2026-10-28: 16.66 fps, 27.9/s,
+    ~31/s single-report bursts median 1/burst 32.7 ms — regime-qualified, see doc 04 §9.11).
+    The app **sends `EF 00 04 00` exactly
     twice at session start** (+0.00 s, +0.10 s), then two 40 B empty reports, then
     `[EF][02][len][body]` receive-progress reports continuously — never a ping again
     (`fid` = last fully received frame, per-record fragment bitmasks; body magic
@@ -91,14 +102,19 @@ empirical from `analysis/04-live-device-validation.md` + `analysis/artifacts/`.
     mirrors that counter; resets to 1 per session; per-session fid counter also starts at 1).
     Report record = `fid u64 | state u32 (1=complete,0=in-flight,3=not-running) | recSize u32
     (0x18=24 B w/ u64 mask, 0x14=20 B w/ u32 mask, 0x10=16 B no mask)`; 8-B zero tail.
-    **H-1 (live-tested 2026-10-26): UNSETTLED** — every report-mode client variant
-    (26/39/63 Hz, const@24 byte-exact, 2-record, after app-exact bootstrap) shows the device
-    halt fragment delivery ~0.3–0.7 s in while heartbeats continue; the app's own reports
-    sustain 16 fps for minutes. The missing device-side condition is open (doc 04 §9.6 D).
+    **H-1 (RF-decided 2026-10-28): DEVICE-side** — every report-mode client variant
+    (26/39/63 Hz, const@24 byte-exact, 2-record, app-exact bootstrap,
+    completion-correlated empties) halts fragment delivery ~0.3–1.2 s in while heartbeats
+    continue; simultaneous monitor capture shows the device stops sending at the air
+    interface for 41 s (client loss/power-save/driver excluded in one experiment; the
+    app holds no Wi-Fi lock — static DEX evidence). Our intra-burst rate reaches
+    14.9 fps, so the pipe is there; the missing condition is a property of the app's
+    report stream — last untested lever: its mixed-shape report state machine
+    (doc 04 §9.11). The app's own reports sustain 16 fps for minutes.
   - **App-exact bootstrap = 2× ping + 2× empty report (IE doc 04 §9.6 A, tape-verified):** the
     device's first video fragment arrives +0.10 s after the first ping; first record report
     +0.21 s (fid=2). Prototype implementation: `BoliUReportTransport` (REQ-BOL-008/009,
-    suite 87/87) — live fps still capped ~4 fps (H-1 open).
+    suite 87/87 at introduction — 98/98 current) — live fps still capped ~4 fps (H-1 open).
   - Interface note (2026-10-26 evening): this boot's radio interface is **`wlan1`** (the
     earlier udev/iwd rename to `wlan0` was session-specific — check `iwctl device list` first).
     Per-frame last page is a short datagram (remainder + 56 B header) — expected by
@@ -119,8 +135,10 @@ empirical from `analysis/04-live-device-validation.md` + `analysis/artifacts/`.
   - "Extraneous bytes before marker 0xd9": **not live-only, and explained** (CORRECTED
     2026-10-27, doc-04 §9.8): it is the bottom raster rows' encoded entropy that a
     640×360-canvas head cannot consume. Under `djpeg` it appears on 10/10 lossless tape
-    frames too (4.7–11.2 kB); patching the canvas to 640×480 collapses it (~3 B on fid
-    2080). Instrument note: **PIL/Pillow swallows libjpeg warnings** — any "decodes with
+    frames too (4.7–11.2 kB); patching the canvas to 640×480 collapses it entirely
+    (10/10 djpeg-clean after the amended page0 slice — `frag0_layout_2026-10-27`) — the
+    "~3 B on fid 2080" residual was an artifact of the old `d[67:]` slice (retracted,
+    doc-04 §9.9). Instrument note: **PIL/Pillow swallows libjpeg warnings** — any "decodes with
     no warnings" claim must be re-checked with `djpeg`.
   - **Decode/reassembly equivalence to the app (2026-10-26; caveat added 2026-10-27 after
     a 5-agent adversarial gate FAILED 3/5; page0 slice corrected after gate round 0 — see
@@ -131,16 +149,18 @@ empirical from `analysis/04-live-device-validation.md` + `analysis/artifacts/`.
     the d[67:] slice shifted the entropy 11 B; amended REQ-BOL-004), others d[56:]; contiguous
     idx-ordered assembly; retransmit overwrite; EOI `FF D9` appended only when idx==cnt-1
     arrives (`handle_mcu_msg_frag` @0x230c, helper @0x2640; doc-04 §9.7). Page-boundary
-    arithmetic: 0 anomalies on all **34 862** fragments (22 152 live_now + 12 710
-    session_start5; +7 short `[0x93][01]` control datagrams 58–67 B are not fragments;
-    all 78 261 fragments of all taped sessions clean). **Corrections (§9.8)**:
+    arithmetic: 0 anomalies on all **34 869** fragments (22 158 live_now + 12 711
+    session_start5 — all 0x93/01 datagrams are fragments; the 7 short 57..67-B
+    datagrams are SHORT LAST PAGES (`len == 56 + size−(cnt−1)·1024`), 10/10 across
+    tapes — the "control datagrams" mis-read was retracted 2026-10-28;
+    all 78 268 fragments of all taped sessions clean). **Corrections (§9.8)**:
     (1) the wire raster is **640×480** — "bogus 480" was wrong; the native helper patches
     the head copy's SOF0 dims per frame from d[44]/d[46] (@0x26dc/0x26e4, head+145/147);
-    the prototype does the same now (REQ-BOL-010, suite 96/96), otherwise the bottom 120
+    the prototype does the same now (REQ-BOL-010, suite 98/98), otherwise the bottom 120
     rows were silently clipped; (2) the native completion scan never tests page-0's mask
     bit and recycles ring slots (fid−4) without clearing buffers — the *app* accepts
     page0-loss frames with stale slot content; the prototype drops them instead (deliberate
-    divergence); (3) **the user's left/top stripes were OUR OWN slicing bug** — the
+    divergence; suite 98/98 current); (3) **the user's left/top stripes were OUR OWN slicing bug** — the
     "device-side foreign content" attribution (7/10 tape frames, foreign-palette band) and
     its later "device-side top-row pipeline" refinement were both artifacts of the wrong
     `d[67:]` slice; under the wire-exact slice all 10 tape frames decode clean and every
@@ -193,7 +213,7 @@ empirical from `analysis/04-live-device-validation.md` + `analysis/artifacts/`.
 - **Validation prototype** (user-authorized implementation, not production): `prototype/`
   — PyQt6 client with spec-first TDD (`prototype/docs/ARCHITECTURE.md` is binding; no code
   without a REQ id). Tests: `cd prototype && QT_QPA_PLATFORM=offscreen
-  /home/stefan/reveng/SL_ylz/.venv/bin/python -m pytest tests/ -q` (72 passing). App runs
+  /home/stefan/reveng/SL_ylz/.venv/bin/python -m pytest tests/ -q` (98 passing). App runs
   need `PYTHONPATH=src`. The six `data/jhdr_Q{5,10,25,50,75,100}.bin` heads (605 B) are the
   per-frame decode recipe of §10b.6; prior "Q100 always" test expectations are superseded.
 

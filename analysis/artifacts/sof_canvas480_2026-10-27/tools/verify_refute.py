@@ -1,4 +1,5 @@
 #!/home/stefan/reveng/SL_ylz/.venv/bin/python
+# SUPERSEDED 2026-10-27: parses the retracted d[67:] frag0 layout (FRAG0=67, adversarial-gate round 0); every band/warning number THIS script produced is an artifact of that slice — see ../frag0_layout_2026-10-27/ and doc-04 §9.9 D.
 """Independent spot-check of the refuting agent's two decisive claims:
 (1) PIL is warning-blind; djpeg shows surplus entropy on tape frames.
 (2) Trimming payload to (size - junk) yields byte-identical pixel output."""

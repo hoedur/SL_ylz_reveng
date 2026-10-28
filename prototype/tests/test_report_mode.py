@@ -2,9 +2,10 @@
 
 Vectors per the original-app monitor capture (doc-04 §9.5, arc42 §10b.10):
 
-- report datagram: ``EF 02 40 00`` + body ``02 02 00 01 | 01 00 00 00 | 16×00 |
+- report datagram: ``EF 02 40 00`` + body ``02 02 00 01 | 01 00 00 00 | 12×00 |
   0A 4B 14 2D | fid LE32 | 00 00 00 00 | 01 00 00 00 | 18 00 00 00 | FF×8 |
-  00 00 00 00 00 00 00 00`` (64 B total, len16 = 64 counts the whole datagram);
+  00 00 00 00 00 00 00 00`` (64 B total, len16 = 64 counts the whole datagram;
+  4×00 before fid — const ``0A 4B 14 2D`` at datagram offset 24);
   ``fid`` = most recently completed frame_id, 0 until the first completion.
 - keepalive: ``EF 08 08 00`` + one LE32 = seconds since transport start,
   initialized from the seq of the first received heartbeat.

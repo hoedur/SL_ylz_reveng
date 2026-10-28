@@ -9,7 +9,10 @@ Wire summary (all offsets into the received datagram ``d``):
 - fragment (``d[1]==1``): ``frame_id`` LE32 @8, ``idx`` LE32 @32, ``cnt`` LE32 @36,
   ``size`` LE32 @40, ``w``/``h``/``q`` LE16 @44/46/48; page data at ``d[56 : len-11]`` for
   ``idx==0`` (frag0 carries 11 trailing ASCII metadata bytes; every header is 56 B) else
-  ``d[56:]``;
+  ``d[56:]``; *(2026-10-28: ``frame_id`` is empirically a ring-buffer slot id cycling in a
+  tiny set {1..3} across sessions — frames are distinguished only by the
+  ``(frame_id, size)`` key, which is why size is part of it; live confirm
+  `analysis/artifacts/live_confirm_2026-10-28/`)*;
 - heartbeat (``d[1]==4``, total length 16): ``seq`` LE32 @4, ``pad`` @8, ``drift`` @12;
 - ping every 90 ms: ``EF 00 04 00`` to ``host:port`` (default 8800);
 - reassembly keyed ``(frame_id, size)``, complete at first ``cnt`` indices,
@@ -231,7 +234,7 @@ class BoliUTransport(DeviceTransport):
         if want != len(d):  # REQ-BOL-003: framing length mismatch
             self._malformed(addr_s, d, {"want_len": want, "got_len": len(d)})
             return
-        if len(d) < 68:  # REQ-BOL-004: fragment parsing needs >= 68 B
+        if len(d) < 50:  # REQ-BOL-004: field access needs >= 50 B (q spans 48..50)
             self._malformed(addr_s, d, {"reason": "too_short", "got_len": len(d)})
             return
         (frame_id,) = struct.unpack_from("<I", d, 8)
@@ -259,6 +262,16 @@ class BoliUTransport(DeviceTransport):
             return
         if size <= 0:
             self._malformed(addr_s, d, {"reason": "size_range", "size": size})
+            return
+        # REQ-BOL-004 length floor, per index (amendment 2026-10-28, gate-1
+        # round 1 validator 2): every fragment is 56-B header + page; frag0
+        # additionally carries the 11-B trailing tail. A short LAST page
+        # (page < 12 B -> datagram 57..67 B for idx > 0) is a valid fragment:
+        # wire-proven on 10 short last pages across three tapes (the earlier
+        # blanket <68 gate mis-classified them as "control datagrams").
+        floor = 68 if idx == 0 else 57
+        if len(d) < floor:
+            self._malformed(addr_s, d, {"reason": "too_short", "got_len": len(d)})
             return
         # Amended REQ-BOL-004 (gate-1, 2026-10-27): frag0's page excludes the 11
         # trailing ASCII metadata bytes; mid/last pages have no tail.

@@ -447,6 +447,50 @@ def test_type1_datagram_shorter_than_50_bytes_is_malformed_no_crash(h, n):
     h.assert_no_frames()
 
 
+# --- short last-page fragments (REQ-BOL-004 amendment 2026-10-28) ------------
+
+
+def test_short_last_page_fragment_is_accepted(h):
+    # Amendment 2026-10-28 (gate-1 round 1, validator 2): a LAST page can be
+    # < 12 B, making its datagram 57..67 B — wire-proven 10/10 across three
+    # tapes (`56 + size-(cnt-1)*1024`; the old blanket <68 gate dropped these
+    # real fragments as "too short"). A 3-B last page at idx == cnt-1 must
+    # parse, deliver the frame, and carry the correct 3-B page bytes.
+    fid = 93
+    size = 2 * 1024 + 3  # cnt=3 -> pages 1024/1024/3
+    h.send(fragment(fid, 0, 3, size, mkpage(1, 1024)))
+    h.send(fragment(fid, 1, 3, size, mkpage(2, 1024)))
+    last = fragment(fid, 2, 3, size, mkpage(3, 3))
+    assert len(last) == 59  # 56 hdr + 3-B page, no tail -> below the old <68 floor
+    h.send(last)
+    h.col.wait_for(
+        "frame completes via the 59-B short last page",
+        lambda e: e.kind == "frame_complete" and e.fields["size"] == size,
+    )
+    frames = h.pop_frames()
+    assert len(frames) == 1
+    jpeg, _ts = frames[0]
+    # pages: 1024 + 1024 + 3 = 2051 + 605 head + EOI = 2658
+    assert len(jpeg) == 605 + size + 2
+    assert jpeg[605 + 2 * 1024 : 605 + 2 * 1024 + 3] == mkpage(3, 3)
+    assert jpeg[-2:] == b"\xff\xd9"
+
+
+def test_short_nonlast_fragment_is_still_malformed(h):
+    # A short page on a NON-last fragment (expected 1024 B) is malformed:
+    # <57 B -> too_short; 57..67 B -> page_len_mismatch. Zero frames.
+    short_mid = fragment(94, 1, 3, 2100, mkpage(2, 5))  # 61 B, expected 1024
+    assert len(short_mid) == 61
+    h.send(short_mid)
+    h.col.wait_for(
+        "malformed for short non-last page",
+        lambda e: e.kind == "malformed",
+    )
+    h.col.settle()
+    assert len(h.col.by_kind("malformed")) == 1
+    assert h.col.by_kind("frame_complete") == []
+
+
 # --- REQ-BOL-001 source filtering ------------------------------------------
 
 

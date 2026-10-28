@@ -2,10 +2,12 @@
 
 Correction: the frag0 "11 extra bytes" are **trailing** (`d[len-11:len]`, ASCII, e.g.
 `-0214,-0894`), not leading. Every fragment header is 56 B; page0 = `d[56:len-11]`
-(1024 B). Native proof: `libbl_vii_jni.so` block `0x26e8–0x2702` (idx==0 only) copies the
+(1024 B). Native proof: `libbl_vii_jni.so` block `0x26e8–0x2704` incl. (idx==0 only; addr
+corr. 2026-10-28 gate round 1 — the second-half store completes at 0x2704, `subs r0,#56`
+@0x26e2) copies the
 last 11 contiguous bytes into a fixed landing zone at `slot+0x1000a4` (ring slot stride
 `0x1000b0`); exhaustive store sweep over `0x230c–0x2760` finds exactly four head-region
-writes (head copy @0x26bc/26c4, SOF0 dims @0x26dc/0x26e4, EOI @0x266e) — no others.
+writes (head copy @0x26bc/26c4, SOF0 dims @0x26dc/0x26e4, EOI `strh` @0x266c) — no others.
 Scratch: /tmp/opencode/gate1_sof0/ (callsite.txt, sweep.py, decode outputs).
 
 ## Per-frame result (live_now.tsv, 10 complete frames, SOF0-patched 640x480 head)
@@ -26,9 +28,14 @@ Scratch: /tmp/opencode/gate1_sof0/ (callsite.txt, sweep.py, decode outputs).
 - NEW = **10/10 djpeg-clean**; old = 7/10 warning (incl. the "3 extraneous bytes" fid-2080
   headline, now explained as a slicing artifact).
 - All V2-style MCU-row edge spikes (y=8/16/24, "top slab") **vanish** under the corrected
-  slice → the §9.8-device-side top-band attribution (and validator 2's "device-side top-row
-  pipeline effect" mechanism) is refuted: the artifact was OUR 11-B entropy shift. Remaining
-  band-mean deltas are scene-level (not MCU-aligned).
+  slice: the residual at the *former spike row* is ≤1.35 luma for those frames (worst
+  2561: 1.35). Column note: "worst MCU-row edge" quotes the edge **at the old spike's
+  row** — the *global* new-slice max over y∈{8,16,24} is ≤1.87 (fid 2553, whose old
+  edge was only 2.0); doc-04 §9.9 D therefore says "collapse to ≤1.35 (spike frames)",
+  i.e. every frame that HAD a spike is spike-free.
+  Under the corrected slice → the §9.8-device-side top-band attribution (and validator 2's
+  "device-side top-row pipeline effect" mechanism) is refuted: the artifact was OUR 11-B
+  entropy shift. Remaining band-mean deltas are scene-level (not MCU-aligned).
 - `frag0_verify.json` holds the full records (bandΔ = mean absolute channel delta rows 0-14
   vs 18-32, old §9.7-C criterion; edges = row-to-row luma discontinuities at y=8/16/24 plus
   baseline max at y≥32).

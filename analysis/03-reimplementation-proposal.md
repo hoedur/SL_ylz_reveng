@@ -65,8 +65,11 @@ scope-core/
  │   │                     receive [93][01][len16] fragments from :1234 (1091/1080-B datagrams),
  │   │                     reorder by frag index (u32@32), assemble by size (u32@40);
  │   │                     heartbeat [93][04][…16 B / 1.6 s] — optional stats only;
- │   │                     device profile: 640×360, NO sensor channel, no command/quality control
- │   │                     frame output: jpeg = embedded-header(Q<q>, q = announced byte@48) + pages + FF D9
+ │   │                     device profile: wire raster 640×480 (head SOF0 patched per frame,
+ │   │                     arc42 §10b.11b), sensor channel candidate = frag0's 11 trailing
+ │   │                     ASCII bytes (unverified, arc42 §10b.4), no command/quality control;
+ │   │                     frame output: jpeg = embedded-header(Q<q>, q = announced byte@48,
+ │   │                     SOF0-patched to d[44]/d[46]) + pages (page0 = d[56:len-11]) + FF D9
  │   ├─ beken_udp         ⬆ SECONDARY — bytecode-derived, NOT validated on live hardware:
  │   │                     7080 datagram FSM: cmd = {0x20,0x36} start, {0x20,0x37} stop;
  │   │                     framing: picId@2 pkType@3, len-4 payload, 1472 MTU,
@@ -96,9 +99,9 @@ must expose or parametrize (full evidence in arc42 §10b.9 / `04-live-device-val
 | transport | UDP 8800 ping / 1234 data | UDP 7080 (+TCP 2271 side channel) | USB isochronous/bulk |
 | framing | 56-B frag header, 1024-B pages | ≤1472-B, picId/pkType, 102400-B buffer | MJPEG frames |
 | JPEG headers | none on wire → phone prepends the head matching the frame's announced quality + EOI | self-contained | self-contained |
-| resolution/quality | 640×360, fixed effective quality | 640×360 nominal, `setQPara` unused by app | UVC-negotiated + PU controls |
+| resolution/quality | wire raster 640×480 (§10b.11b), fixed effective quality | 640×360 nominal, `setQPara` unused by app | UVC-negotiated + PU controls |
 | session | ping-serve (≤101 ms), sticky port | start/stop commands | file/FD open-close |
-| attitude | none | TCP 2271 packets | manual/phone |
+| attitude | none *(caveat 2026-10-27: frag0's 11 trailing ASCII bytes = unverified candidate sensor channel — arc42 §10b.9)* | TCP 2271 packets | manual/phone |
 | commands | none required | `{0x20,0x36}` etc. | UVC PU get/set |
 
 **Validated BoliU client algorithm** (complete; the only facts needed to talk to the physical unit):
@@ -106,14 +109,24 @@ must expose or parametrize (full evidence in arc42 §10b.9 / `04-live-device-val
 1. Bind an ephemeral UDP socket.
 2. Send `EF 00 04 00` to `ip:8800` every ≤80–100 ms (delivery stops ~101 ms after the last datagram;
    any payload to 8800 keeps the stream target alive; a single ping yields ~1 frame).
+   *(Caveat 2026-10-26/27: "keeps the target alive" ≠ guarantees sustained delivery — our report-mode
+   sessions (EF-02/EF-08 replay, EXP1–3) open but then halt; sustained report-mode delivery is
+   device-condition-open, H-1, doc-04 §9.6 D / §9.9 C.)*
 3. Receive on the same socket (source port 1234):
    - `len == LE16@2`, `type@1 == 1` → fragment: `idx = u32@32`, `cnt = u32@36`, `size = u32@40`;
-     page data = bytes 67.. (frag0, 1024 B) or 56.. (others; last = fragment of `size` remainder);
-     set bitmap bit `idx` — fragments may arrive out of order.
+     page data = `d[56:len-11]` for frag0 (1024 B; 11 TRAILING ASCII metadata bytes at
+     `d[len-11:len]` — REQ-BOL-004 amended 2026-10-27) or `d[56:]` for others (last = fragment of
+     `size` remainder); set bitmap bit `idx` — fragments may arrive out of order.
+     *(Reassembly key = (u32@8 frame id, size); under ping-only delivery the id cycles in a small
+     set {1..3} (monotonic under the app's report mode, where it equals the report fid) — 2026-10-28
+     gate rounds 1+2, doc-04 §9.9 G/§9.10.)*
    - `type@1 == 4` (16 B) → heartbeat (optional).
    - When all `cnt` bits set → frame complete.
-4. Emit frame bytes = `jhdr_Q<q>_bin (605 B, q Low-byte of announced u16@48 — heads from the .so) + Σ pages in idx order + FF D9` → stock JPEG decode,
-   640×360 RGB. (Q5..Q75 heads fail to decode; the announced quality byte is not the selection key.)
+4. Emit frame bytes = `jhdr_Q<q>_bin (605 B, q Low-byte of announced u16@48 — heads from the .so),
+   SOF0 dims patched per frame to the announced (w,h) = 640×480 (BE16 at head+145/147; arc42
+   §10b.11b) + Σ pages in idx order + FF D9` → stock JPEG decode, 640×480 RGB
+   (amended 2026-10-27; the "Q5..Q75 fail to decode / q is not the selection key" claims were
+   retracted 2026-10-24 — the announced quality byte IS the head-selection key).
 5. Jitter-normalize: device delivers in bursts (~25 fps intra-burst) with ~0.5 s stalls (~3–4 fps
    effective); buffer on the display side.
 6. Device reboot/power-cycle clears the stream target — re-arming happens automatically via the pings.
@@ -147,7 +160,8 @@ For the **USB mode**: the probe class 239/2 means you can rely on the OS's built
 ### 2.5 Where "IMU"/attitude could be *better* (opportunity)
 
 The stock app streams a 2D roll angle only — **and the delivered BoliU unit streams no attitude at all**
-(the heartbeat drift word is not a sensor). For the FOSS replacement the attitude source is a pluggable
+(the heartbeat drift word is not a sensor)*(caveat 2026-10-27: frag0's 11 trailing ASCII bytes are an
+unverified candidate sensor channel — arc42 §10b.9; candidate REQ-BOL-011)*. For the FOSS replacement the attitude source is a pluggable
 strategy (R3):
 1. **Device stream parser** (Beken families): parse the same TCP-2271 2D packets for absolute compatibility — used only when a device family actually provides the channel.
 2. **Phone-sensor fallback (now the default for BoliU units)**: use the phone's `TYPE_ROTATION_VECTOR` / accelerometer. The stock app already implements this fallback for type-16 devices, so the UX pattern exists.
@@ -190,11 +204,12 @@ strategy (R3):
   indexes and sizes are pinned and integrity-checked.
 - Heartbeat internals: the `seq` field changed semantics after a device reboot (+1/beat → constant);
   drift word `5e xx` is not an accelerometer value. Passive stats only — no design impact.
-- The 11 extra bytes on every first fragment — purpose unknown; ignored safely by the validated recipe.
+- The 11 extra bytes on every first fragment — **resolved 2026-10-27 (reversal)**: TRAILING ASCII
+  metadata at `d[len-11:len]`, candidate sensor readouts (§9.9 F / arc42 §10b.9); ignored safely by
+  the validated recipe (page slicing excludes them), surfaceable later as a sensor event (candidate REQ-BOL-011).
 - `sendSexCmd`/`sendHBCmd` control bytes (type-86 family) — bytecode-built at runtime; only relevant
   if such a unit is ever driven.
-- Quality control (`setQPara`): never exercised by the app, no live effect; the device self-varies quality per frame (25/50/75) and the client must select the matching embedded head (605 B; §10b.6, corrected 2026-10-24)
-  observed; treat device quality as fixed per family (profile table in §2.2).
+- Quality control (`setQPara`): never exercised by the app, no live effect; the device self-varies quality per frame (25/50/75) and the client must select the matching embedded head (605 B; §10b.6, corrected 2026-10-24); treat device quality as fixed per family (profile table in §2.2).
 - armeabi-v7a payload of the vendor — new build can and should be **arm64-first**.
 - Controller zoo: the delivered unit is BoliU *this-firmware*; the Beken driver cannot be live-verified
   until such a unit is in hand (hence the pluggable trait + the packet-debug screen).

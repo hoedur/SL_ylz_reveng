@@ -4,6 +4,10 @@
 Reports: per-frame q / size / cnt, decode result, timing gaps between
 frame completions, and saves the LAST decoded frame as PNG for the
 color A/B against the app screenshot.
+
+Slice amended 2026-10-27 (REQ-BOL-004, adversarial gate round 0):
+frag0 page = d[56:len-11] — 11 TRAILING ASCII metadata bytes (the old
+d[67:] slice shifted the entropy 11 B).
 """
 import io
 import statistics
@@ -23,7 +27,9 @@ for line in Path("/tmp/opencode/live_fix.tsv").read_text().splitlines():
         d = bytes.fromhex(parts[3])
     except ValueError:
         continue
-    if len(d) >= 68 and d[0] == 0x93 and d[1] == 1:
+    # Per-index floors (REQ-BOL-004 amendment 2026-10-28): frag0 = 68 B, idx>0 = 57 B —
+    # short last pages (57..67 B) are VALID fragments.
+    if len(d) >= (68 if idx == 0 else 57) and d[0] == 0x93 and d[1] == 1:
         parts_ts = float(parts[0])
         frags.append((parts_ts, int.from_bytes(d[2:4], "little"), d))
 
@@ -41,7 +47,7 @@ for ts, want_len, d in frags:
     q = d[48]
     key = (frame_id, size)
     pages = pending.setdefault(key, {})
-    pages[idx] = d[67 if idx == 0 else 56:]
+    pages[idx] = d[56 : len(d) - 11] if idx == 0 else d[56:]
     if len(pages) == cnt:
         payload = b"".join(pages[i] for i in range(cnt))
         del pending[key]

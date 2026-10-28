@@ -1,6 +1,6 @@
 # arc42 Architecture Documentation — "SL+ylz" Wi-Fi/USB Ear Otoscope App
 
-Reverse-engineered from `SL+ylz_V1.0.23.251121_APKPure.xapk`\
+Reverse-engineered from `SL+ylz/V1.0.23.251121/SL+ylz_V1.0.23.251121_APKPure.xapk`\
 Package: `com.xiaozhen.beauty.shenglong` · Version 1.0.23 (code 23) · minSdk 23, targetSdk 35\
 Analysis date: 2026-10-17 (live-device validation 2026-10-23/24/26/27, §10b + doc-04 §9) · Method: manifest/resource decode (androguard), DEX bytecode inspection, native `.so` symbol/string analysis
 
@@ -36,7 +36,7 @@ The app is closed-source, phones home, and its privacy posture is poor (see §10
 | Text-traffic (HTTP) allowed globally | `network_security.xml` (`cleartextTrafficPermitted="true"`) |
 | Native code only built for **armeabi-v7a** (no arm64!) — works only via 32-bit ABI or vendor support | `config.armeabi_v7a.apk` |
 | Device camera is a WiFi AP. Two controller families ship: "Beken"-driven units (Java stack, UDP 7080, default IP `192.168.0.1`) and **BoliU/Bouffalo-Lab units** (native stack, UDP 8800/1234). The delivered physical unit is a **BoliU "BL384"** (§10b): MAC OUI `F4:42:50` (Bouffalo Lab Nanjing), IP `192.168.169.1`, UDP-only. For unit types, `BlSdk.start(ip)` / `BekenSdk.start(ip)` take the IP as a parameter | DEX + `notes.md` nmap + §10b pcaps |
-| Sensor hardware on device = 2-axis accelerometer ("G-sensor") on the **Beken** family, reported over its own TCP channel; **no gyroscope in any family**. *The validated BoliU unit streams no sensor channel at all* (§10b) | `GsensorParser2D`, 2D angle math only + §10b |
+| Sensor hardware on device = 2-axis accelerometer ("G-sensor") on the **Beken** family, reported over its own TCP channel; **no gyroscope in any family**. *The validated BoliU unit streams no sensor channel at all* (§10b) *(caveat 2026-10-27: frag0's 11 trailing ASCII bytes, e.g. `-0214,-0894`, are an unverified candidate sensor channel — §10b.4/§10b.9, doc-04 §9.9 F)* | `GsensorParser2D`, 2D angle math only + §10b |
 
 ---
 
@@ -188,11 +188,11 @@ The app is closed-source, phones home, and its privacy posture is poor (see §10
 Two independent transports:
 1. **WiFi probes (default)**: the phone connects to the probe's **WiFi access point**. Two controller families exist:
    - **Beken** units (shipped-APK Java driver): **UDP port 7080** on the AP subnet (`192.168.0.1` default). Control datagrams and reassembly handshake also on 7080; G-sensor angle packets on a **separate TCP socket, port 2271**. Phone binds UDP locally to 7080 and sends start/stop/voice 2-byte commands; frames arrive as ≤1472-byte fragmented JPEG with 4-byte framing header + app reassembly into a 102 400-byte buffer (bytecode-derived; *no live unit matched this driver*).
-   - **BoliU/Bouffalo-Lab units** (shipped-APK native driver `libbl_vii_jni.so`; **the delivered physical unit is this type**, §10b): **UDP 8800** (control + ping gate) / **1234** (data source port), no TCP, no G-sensor channel*. Fragmented JPEG, phone reassembles and prepends its own JPEG header; validated field map + decode recipe in §10b.
+   - **BoliU/Bouffalo-Lab units** (shipped-APK native driver `libbl_vii_jni.so`; **the delivered physical unit is this type**, §10b): **UDP 8800** (control + ping gate) / **1234** (data source port), no TCP, no G-sensor channel *(caveat 2026-10-27: frag0's 11 trailing ASCII bytes are an unverified candidate sensor channel — §10b.9)*. Fragmented JPEG, phone reassembles and prepends its own JPEG header; validated field map + decode recipe in §10b.
 2. **USB probes**: image data over **USB host with UVC (USB Video Class)**, i.e. standard isochronous/bulk transfer of an **MJPEG** elementary stream, provided by libusb1.0 → libuvc → `libUVCCamera.so` JNI bridge. (Native code also contains H264 format branches, so the camera is UVC MJPEG first and probably can do H264 too if a different UVC profile is requested.)
 
 ### 10.2 Video stream details
-- **In-flight (transport) format = JPEG/MJPEG**, **640×360 pix**, native stack contains fixed JPEG headers for quality Q5–Q100 with MJPEG payloads (`jpeg_header_640x360_Q10 … Q100` in `libbl_vii_jni.so`), so every frame is an **independently-coded JPEG (intra-only "MJPG")** — no GOP, no B-frames, trivially cuttable.
+- **In-flight (transport) format = JPEG/MJPEG**, **640×360 pix** *(template canvas; the live wire raster is 640×480 with a per-frame SOF0 patch — §10b.11b)*, native stack contains fixed JPEG headers for quality Q5–Q100 with MJPEG payloads (`jpeg_header_640x360_Q10 … Q100` in `libbl_vii_jni.so`), so every frame is an **independently-coded JPEG (intra-only "MJPG")** — no GOP, no B-frames, trivially cuttable.
 - Bitrate: implicit from JPEG quality/fragment size; typical such probes run ~8–15 fps ≈ **1–4 Mbps**, controlled via `setQPara` (quality) — not an encoder bit rate ceiling *(corrected 2026-10-27: quality is NOT client-controlled in the live-validated BoliU family — `setQPara` has zero Java call sites (§10a) and the device self-varies the announced q per frame, §10b.6; fps superseded: 16.1–16.2 sustained for the app, ~3–4 fps for ping-mode clients, §10b.7/§10b.10)*.
 - No audio in the stream; recorded audio is the phone mic (AAC 44.1 kHz/64 kb/s), muxed on-device.
 - Recording output: **H.264 MP4**, encoded by Android MediaCodec from the decoded/rendered bitmaps/GL surface (target bitrate ≈ width·height·0.63·15).
@@ -200,7 +200,7 @@ Two independent transports:
 
 ### 10.3 Is there an IMU / how is orientation used; who rotates?
 - **There is a 2-axis accelerometer ("G-sensor") on the device, not a (3-axis) IMU.** No gyroscope, no magnetometer, no quaternions — the app deals only in a single roll angle in degrees in a [-100…+100]-ish 2D frame (`atan2(y,x)·100/π`).
-- The angle data is **transported out-of-band** from the video: over the probe's **TCP 2271** channel in the *Beken* WiFi mode; it is not embedded in the UVC/USB mode at all. **The delivered BoliU unit exposes no sensor channel on any port (live-verified, §10b)** — its firmware streams no orientation data, so a FOSS client must fall back to the phone's own sensors or manual rotation for such units.
+- The angle data is **transported out-of-band** from the video: over the probe's **TCP 2271** channel in the *Beken* WiFi mode; it is not embedded in the UVC/USB mode at all. **The delivered BoliU unit exposes no sensor channel on any port (live-verified, §10b** *(caveat 2026-10-27: frag0's 11 trailing ASCII bytes are an unverified candidate sensor channel — §10b.9)*)** — its firmware streams no orientation data, so a FOSS client must fall back to the phone's own sensors or manual rotation for such units.
 - **Rotation is applied 100 % in the app**: WiFi mode computes `Matrix.postRotate(angle)` per displayed frame (with a 2-frame-deep image/angle ring buffer and an EMA-like filter + boundary handling for the 360° wrap-around of type 86), then draws the rotated bitmap on the SurfaceView. UVC mode offers a **manual** rotate button (no sensor data available).
 - The **device itself does not rotate** the video (no on-device codec or image flip detected; device has no image-processing path in any of the three modes).
 
@@ -305,20 +305,21 @@ Fragment header fields (offsets within the UDP payload; u32 LE unless noted):
 |---|---|---|---|
 | 0..3 | — | transport hdr `93 01 <len LE16>` | len == datagram length |
 | 4..7 | — | signature `02 02 00 01` | const |
-| 8..11 | u32 | frame id (alternates 1/2) | flips per frame |
+| 8..11 | u32 | **frame id** — the CANONICAL reading (2026-10-28 gate round 2 validator 3): under the app's report mode it is **strictly monotonic and IS the EF-02 report fid** (d8 ∈ report fids within ±0.3 s: 2105/2111 live_now, 830/869 session_start5; strict 1998→2728 / 1→463, zero decrement transitions); under ping-only delivery the device hands out ids from a small ring {1..3} ({1,2} in the 2026-10-28 tape, {1,2,3} 976/979 in the 2026-10-27 own_session) — the earlier "ring-slot id, NOT a frame id" reading was ping-tape-only and is REFINED | increments per frame |
 | 12..15 | u32 | 0 | const |
 | 16..19 | u32 | frame id duplicate | = field above |
-| 20..31 | — | 0 | const |
+| 20..23 | u32 | 0 | const |
+| 24..27 | u32 | **previous frame id** (ping tapes: `max(d8−2, 0)` exact 3858/3858; found by round-2 validator 3 — the earlier "20..31 = 0 const" row was incomplete) | decrements with d8 |
 | 32..35 | u32 | **fragment index**, 0-based | 0..cnt−1; out-of-order arrival possible → reorder by index |
 | 36..39 | u32 | **fragment count** = `ceil(size/1024)` | 22 for 21 962 B ✓ |
 | 40..43 | u32 | **frame size in bytes** | e.g. 14059, 20932, 33518, 33634, 21962… |
 | 44..45 | u16 | width = 640 (`0x0280`) | const |
 | 46..47 | u16 | height field = 480 (`0x01E0`) — the REAL raster height; the template heads' 640×360 SOF0 is patched per frame to the announced (w,h) by the native decoder (CORRECTED 2026-10-27, §10b.11b) | const |
-| 48..49 | u16 | quality/status word: low byte = quality (`0x19`=25, `0x4b`=75 …), high byte = frame id−1 | low byte IS the head-selection key (corrected 2026-10-24; §10b.6) |
+| 48..49 | u16 | quality/status word: low byte = quality (`0x19`=25, `0x4b`=75 …), high byte = **alternation bit = (frame id − 1) mod 2** (round-2 validator 3: 38 710/38 727 exact across all tapes — explains the former "slot−1, 54/55" which is the same predicate on id∈{1,2} tapes) | low byte IS the head-selection key (corrected 2026-10-24; §10b.6) |
 | 50..51 | u16 | 2 | const |
 | 52..55 | u32 | frag0 only: `0x0438000b` — low u16 = **11** = trailing-byte count; high u16 = 1080 | 0 elsewhere |
 | 56.. | — | page data: **every** fragment carries its page from byte 56 (frag0: `d[56:1080]`, 1024 B; others: 1024 B; last = `size` remainder) | |
-| len-11..len | — | **frag0 only: 11 trailing ASCII metadata bytes** (amended 2026-10-27 — NOT page data; e.g. `-0214,-0894`, candidate sensor readouts; natively stashed at `slot+0x1000a4` by block `0x26e8–0x2702`). The earlier reading "11 varying bytes at offsets 56..66 / frag0 header 67 B" was inverted | varies |
+| len-11..len | — | **frag0 only: 11 trailing ASCII metadata bytes** (amended 2026-10-27 — NOT page data; e.g. `-0214,-0894`, candidate sensor readouts; natively stashed at `slot+0x1000a4` by block `0x26e8–0x2704` incl., addr corr. 2026-10-28 gate-1). The earlier reading "11 varying bytes at offsets 56..66 / frag0 header 67 B" was inverted | varies |
 
 Frame integrity: Σ(fragment data) == field @40 exactly; Σ(header overhead) = 1243 B for cnt=22
 (22×56 + 11) — verified on all captured frames.
@@ -386,7 +387,8 @@ where `q` = the **announced quality byte = low byte of the u16 at fragment offse
 2. **No Beken UDP 7080 protocol** — `{0x20,0x36}` etc. sent live to 7080/1234/8800/63736 produced zero
    reactions on this unit.
 3. **No sensor channel** — no orientation data is streamed by this device in any form (heartbeat drift
-   word is not an accelerometer).
+   word is not an accelerometer) *(caveat 2026-10-27: frag0's 11 trailing ASCII bytes — e.g.
+   `-0214,-0894` — are an unverified candidate sensor channel; arc42 §10b.4/§10b.9, doc-04 §9.9 F)*.
 4. **No device configuration** — live corroboration of §10a: no AP/STA switch, and no *client-controllable*
    quality change occurs despite `setQPara` (the Q5..Q100 header table is present but picked by the
    device's own per-frame announcement; the device self-varies q = 25/50/75, §10b.6).
@@ -407,7 +409,7 @@ this as a **pluggable `DeviceTransport`** with at least these capabilities per i
 | JPEG header strategy | per-device | phone-side per-frame `q` head prepend (605 B heads, §10b.6) + EOI |
 | resolution / quality preset | device/firmware | wire raster 640×480 (SOF0-patched per frame, §10b.11b); quality self-varies per frame (25/50/75), not client-adjustable |
 | keep-alive / session semantics | firmware | EF-00-04 ping-serve ≤101 ms (our client) vs EF-02 reports + EF-08 1.6 s keepalive (app, §10b.10); sticky port |
-**| attitude/sensor channel | optional, per family | **absent** *(candidate caveat 2026-10-27: the frag0 trailing 11 ASCII bytes, e.g. `-0214,-0894`, look like sensor readouts — §10b.4 / doc-04 §9.9; verify before reimplementing)* |
+| attitude/sensor channel | optional, per family | **absent** *(candidate caveat 2026-10-27: the frag0 trailing 11 ASCII bytes, e.g. `-0214,-0894`, look like sensor readouts — §10b.4 / doc-04 §9.9; verify before reimplementing)* |
 | command set (still capture, voice, OTA) | optional, per family | none exercised |
 | device address / discovery | subnet scheme | `192.168.169.1` AP gateway |
 
@@ -472,13 +474,16 @@ retransmit = re-copy into the same destination (last-version-wins); **EOI append
 idx == cnt-1 arrives**.
 *(Page-slice correction 2026-10-27, amended §10b.4: frag0's 11 bytes are TRAILING at
 `d[len-11:len]` and the page is `d[56:1080]` — the `d[67:]` slice shifted the entropy 11 B.
-Fragment recount: 34 862 fragments (22 152 live_now + 12 710 session_start5) of the
-22 158+12 711 0x93-0x01-typed datagrams; the delta = 7 short control datagrams + heartbeats.
-All 78 261 fragments of all taped sessions: 0 page-boundary anomalies.)*
-Empirically, page-boundary arithmetic was verified per datagram on all 22 152 device
-datagrams of the lossless app tape (**0 anomalies**); all 10 completely captured frames decode
-warning-free (640×360, q=75/50) *(this sentence's warnings claim measured nothing — Pillow;
-superseded by §10b.11b/§9.9, all frames are djpeg-clean under the corrected slice at
+Fragment recount *(re-corrected 2026-10-28, gate-1 V2: all 0x93/01 datagrams are fragments —
+the "+7 short control datagrams" were short last pages, §9.9 F.4)*: **34 869 fragments**
+(22 158 live_now + 12 711 session_start5; incl. 6+1 short last-page datagrams of 57..67 B).
+All **78 268** fragments of all taped sessions (34 869 + 43 399 of the static-capture
+`session_start4.txt`, which is not archived under `analysis/artifacts/` — the "12 complete
+frames" figure for it is not re-derivable here): 0 page-boundary anomalies.*
+Empirically, page-boundary arithmetic was verified per datagram on all 22 158 device
+fragment datagrams of the lossless app tape (**0 anomalies**); all 10 completely captured frames decode
+warning-free *(640×360, q=75/50 in the original wording — this sentence's claims were measured
+with the warning-blind Pillow; superseded by §10b.11b/§9.9, all frames are djpeg-clean under the corrected slice at
 640×480)*; first-version vs overwrite distinguishes on 0 frames.
 The user-visible live artifacts (left/top stripes of previous-frame pixels, occasional
 single-frame color shift) are therefore **not** reassembly bugs: left/top is page-0 payload
@@ -504,7 +509,8 @@ Two validated refutations change the record (full evidence: doc-04 §9.8):
    from the announced w/h (write sites @0x26dc/0x26e4 → head+145 = BE16 height,
    head+147 = BE16 width; call-site stash @0x240c/0x2414). Empirically w=640, h=480 on
    **1 061/1 061** frag0 datagrams of both lossless app tapes. The prototype now does the
-   same (REQ-BOL-010, suite 96/96). The former "extraneous bytes before marker 0xd9"
+   same (REQ-BOL-010, suite 96/96 at that round; 98/98 current after the 2026-10-28
+   short-last-page fix). The former "extraneous bytes before marker 0xd9"
    quirk is **explained and benign**: trailing entropy = the bottom 120 raster rows a
    360-canvas head cannot consume *(the small residual numbers — "fid 2080: 8 374 → 3
    extraneous bytes", "premature end" — were artifacts of the wrong page0 slice, retracted
@@ -529,7 +535,8 @@ Two validated refutations change the record (full evidence: doc-04 §9.8):
    page0 = `d[56:len-11]` (§10b.4 field map amended accordingly); helper base =
    caller slot **+0x80** (earlier docs said "minus 0x80" — inverted); fragment header is
    56 B for every fragment; recon/patch write sites unchanged. Prototype amended
-   spec-first (REQ-BOL-004, coordination entry); suite 96/96; the djpeg-clean 10/10
+   spec-first (REQ-BOL-004, coordination entry); suite 96/96 at that round (98/98
+   current); the djpeg-clean 10/10
    verification is the acceptance evidence.
 
 ---

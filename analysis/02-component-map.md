@@ -40,7 +40,7 @@ flowchart LR
 
     MCU -- "UDP 7080: JPEG ≤1472-B fragments\n(bytecode-derived; Beken units)" --> BEKEN
     MCU -- "TCP 2271: angle +\ndev-type + cmd ACK (Beken units)" --> CMD
-    MCU -- "UDP 8800 ping / 1234 data:\nJPEG 640×360, ≤1091-B fragments\n(LIVE-VALIDATED §10b)" --> BLS
+    MCU -- "UDP 8800 ping / 1234 data:\nJPEG 640×480 (SOF0-patched per frame, arc42 §10b.11b), ≤1091-B fragments\n(LIVE-VALIDATED §10b)" --> BLS
     MCU -- "USB: UVC MJPEG\n(class 239/sub 2)" --> USBNATIVE
     GS --> MCU
 
@@ -104,17 +104,20 @@ sequenceDiagram
     loop every 1.60 s
         D-->>P: 16-B heartbeat [93][04][10 00][seq][04 00 00 00][drift u32] (port 1234 →)
     end
-    loop sustained delivery: needs a datagram to 8800 at least every ~101 ms
+    loop sustained delivery: needs a datagram to 8800 at least every ~101 ms (ping-serve, our client regime)
         loop per frame: cnt fragments (cnt = ceil(size/1024))
             D-->>P: [93][01][len LE16][56-B frag header][1024 B page]
             Note over P: reorder by fragment index (out-of-order ok)
         end
-        Note over P: jpeg = jhdr_Q(q) 605 B head, q = announced byte@48<br/>(§10b.6 / §5b-2 corrected)+ Σ pages + FF D9 → decode 640×360 RGB
+        Note over P: jpeg = jhdr_Q(q) 605 B head, q = announced byte@48<br/>(§10b.6 / §5b-2, SOF0 dims patched per frame per §10b.11b)+ Σ pages (page0 = d[56:len-11], amended 2026-10-27) + FF D9 → decode 640×480 RGB
     end
 ```
 
 - Charakteristik: ping-serve (one ping ≈ one/frame-batch served), sticky stream target, bursty delivery
-  (~25 fps intra-burst, ~0.5 s stalls), no TCP, no sensor channel, no configuration protocol.
+  (~25 fps intra-burst, ~0.5 s stalls), no TCP, no configuration protocol. Sensor channel: absent as a
+  dedicated stream, but frag0's trailing 11 ASCII bytes are a candidate readout (arc42 §10b.4, amended
+  2026-10-27). The original app instead streams via 2× ping + EF-02 progress reports (§10b.10); report-mode
+  replays by us halt — H-1 open (doc-04 §9.9).
 
 ## 3. USB/UVC path
 
@@ -122,7 +125,7 @@ sequenceDiagram
 flowchart LR
     USBD["UVC USB probe\n(class 0xEF/0x02 device filter)"] -- iso/bulk MJPEG --> LIBU["libuvc.so + libusb1.0.so"]
     LIBU -- "uvc frames (UVC_FRAME_FORMAT_MJPEG\nH264/YUYV/NV21 also in code)" --> LIBUV["libUVCCamera.so\n(UVCPreview NV21/GL)"]
-    LIBUV →|JNI com.serenegiant.usb.UVCCamera| UVCAPP["herohan CameraHelper"]
+    LIBUV -->|JNI com.serenegiant.usb.UVCCamera| UVCAPP["herohan CameraHelper"]
     UVCAPP -- surface --> GL["EGLBase14 + RendererHolder + GLDrawer2D"]
     GL -- rotate btn (manual) --> VIEW["AspectRatioSurfaceView"]
     GL -- frames --> MEDIA["MediaCodec H.264 → MediaMuxer → MP4\n(+ AudioRecord → AAC)"]
@@ -144,7 +147,7 @@ flowchart TD
 | Boundary | Where | Clean? | Notes |
 |---|---|---|---|
 | **App ↔ probe transport** | `ISocSdk` strategy (`SOC_BEKEN`/`SOC_BOLIU`/`SOC_USB`) | 🟢 good shape, hidden detail | Strategy factory is the right seam — and empirically **essential**: controller families carry their own wire protocols (Beken ≠ BoliU ≠ UVC, see §10b.9 of the arc42 doc); the FOSS design duplicates it as a pluggable `DeviceTransport`. Implementations leak device-type specifics into the UI. |
-| **App ↔ orientation** | `lib.gyro.*` | 🟡 | Parser algorithm per device type is embedded; an interface (e.g. `IAttitudeSource`) is a better boundary. **The BoliU unit supplies no attitude data** — for such devices the source is phone-sensor or manual. |
+| **App ↔ orientation** | `lib.gyro.*` | 🟡 | Parser algorithm per device type is embedded; an interface (e.g. `IAttitudeSource`) is a better boundary. **The BoliU unit supplies no attitude data** *(caveat 2026-10-27: frag0's 11 trailing ASCII bytes are an unverified candidate sensor channel — arc42 §10b.9)* — for such devices the source is phone-sensor or manual. |
 | **App ↔ render pipeline** | `lib.opengl`, `PreserveActivity.RefreshFrameThread` | 🔴 | Rotation+scale+draw is duplicated in 2 activities against 2 different render paths (Bitmap Canvas vs GL). Not factored out. |
 | **App ↔ capture/codec** | `lib.encoder` + `handler.RecordHandler` | 🔴 | This is a verbatim copy of the serenegiant sample code path AND another path in `com.herohan.uvcapp.VideoCapture` — two parallel implementations coexist. |
 | **App ↔ OS** | `UsbManager`, `SensorManager`, `ConnectivityManager`, `MediaCodec`, `MediaMuxer`, `EGL`, `FileProvider`, `Storage Access` | 🟡 | No service abstraction: state lives in Activities; orientation/config changes handled by `configChanges`-freeze instead of lifecycle-aware design. |

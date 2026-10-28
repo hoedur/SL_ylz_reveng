@@ -1,15 +1,18 @@
 """REQ-BOL-010: SOF0 dims patch — native parity for the per-frame raster size.
 
 Evidence chain (doc-04 §9.7/§9.8): the six template heads declare 640×360 at
-SOF0 (head 141..149 = ``FF C0 00 11 08 01 68 02 80``), but the wire announces
+SOF0 (head bytes 140..148 = ``FF C0 00 11 08 01 68 02 80`` — ``FF C0`` at
+140..141, height BE16 at 145..147, width BE16 at 147..149), but the wire announces
 the frame's real raster per frame at d[44]/d[46] — empirically 640×480 on all
 1 061 frag0 datagrams of both 2026-10-26 lossless app tapes. The native decoder
 (``libbl_vii_jni.so`` helper @0x2640) patches the head copy's SOF0 dims
 (head+145 = BE16 height, head+147 = BE16 width, write sites @0x26dc/0x26e4)
 before appending pages; the prototype must patch too, else every frame renders
 on a 640×360 canvas and the bottom 120 rows are silently clipped (they are the
-source of the former "surplus entropy", see 8374 → 3 extraneous bytes on tape
-frame fid 2080).
+source of the former "surplus entropy"; under the amended REQ-BOL-004 page0
+slice the 480-canvas decodes are djpeg-clean on all tape frames — the old
+"8374 → 3 extraneous bytes on fid 2080" pairing was an artifact of the
+retracted ``d[67:]`` slice, gate round 0/1).
 
 Test vectors are constructed from the REQ-BOL-004 byte layout (helper
 ``test_reassembly.fragment``); the ONLY reused binary input is

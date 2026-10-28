@@ -5,7 +5,12 @@ Vectors (REQ-TEST-004, amended):
   and carries a 2-byte stray tail of the adjacent data pool; the valid head is
   ``artifact[:605]`` (ends right after the SOS segment),
 - ``analysis/artifacts/frame0.bin`` — 14 059 B payload of one complete live frame
-  (announced quality byte 25).
+  (announced quality byte 25). *(Provenance note 2026-10-28: frame0.bin was assembled
+  pre-gate round 0 with the retracted ``page0 = d[67:]`` slice — under djpeg the
+  canonical-recipe decode of the *artifact* warns ("3224 extraneous bytes"); the
+  wire-exact rebuild of the same frame is djpeg-clean at 640×480
+  (`analysis/artifacts/frag0_layout_2026-10-27/`). The tests below pass for geometry
+  reasons — PIL is warning-blind; see `analysis/artifacts/README.md`.)*
 
 Contract under test (docs/ARCHITECTURE.md §6 / amended REQ-BOL-005/006):
 - ``JPEG_HEADER_SIZE == 605``; ``JpegHeaderTable`` keys exactly {5,10,25,50,75,100};

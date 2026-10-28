@@ -60,8 +60,10 @@ Append questions/answers below. Format:
   reports it as `malformed` with `fields={"reason": "too_short", "got_len": <67|56>}`. It is
   malformed either way — web-safe to assert kind `malformed` (optionally `got_len`); the
   "page_len==0" denomination is arguable, "too_short" is the bytestructure reason. A ≥68-B
-  datagram with a 0-B page is impossible per the framing (page data begins at 67/56, so
-  ≥68 B ⇒ page_len ≥ 1); do not test the impossible shape.
+  datagram with a 0-B page is impossible per the framing (page data begins at **56 on every
+  fragment**; frag0 additionally carries 11 trailing bytes at d[len-11:len] — amended
+  REQ-BOL-004 2026-10-27, so ≥68 B ⇒ page_len ≥ 1; the old "67/56" wording pre-dated the
+  slice amendment); do not test the impossible shape.
 - [ANSWERED] impl-core: test-protocol #2 (`jhdr_Q100.bin` byte-identity): yes — reading
   `src/otoscope_proto/data/jhdr_Q100.bin` for a byte-identity check against
   `analysis/artifacts/jhdr_Q100.bin` is fine; REQ-ARCH-003's isolation scan is about *imports*
@@ -274,6 +276,10 @@ event fields, steady-state wire has no ping after first report_ack. Suite 87/87.
 
 ## Amendment 2026-10-26 (late) — REQ-BOL-010: SOF0 dims patch; "bogus 480" corrected; artifact attribution revised
 
+> *(log hygiene 2026-10-28: the "device-side artifact attribution" half of this entry was
+> superseded by the 2026-10-27 entry below — the stripes were OUR `d[67:]` slice bug;
+> the REQ-BOL-010 SOF0-patch half stands.)*
+
 **Trigger**: user-reported stripes/color-shift + adversarial validation round (5 agents,
 gate FAILED 3/5 — conclusion rescope). Decisive new facts:
 
@@ -303,10 +309,133 @@ Tests to add: patch function byte-exactness (Q25 head + (640,480) → `01 e0 02 
 
 ## Amendment 2026-10-27 — REQ-BOL-004: frag0 wire-exact layout (gate-1 validator, adversarial round 0)
 
-Disassembly-driven correction (native block `0x26e8–0x2702` in `libbl_vii_jni.so`, exhaustive store sweep over `0x230c–0x2760`): **frag0's "11 extra bytes" are TRAILING, not leading.** Every fragment's header is 56 B; frag0 datagrams append 11 trailing ASCII metadata bytes at `d[len-11:len]` (e.g. `-0214,-0894`; natively stashed at `slot+0x1000a4..0x1000af`, ring slot stride `0x1000b0`). The previously documented `page0 = d[67:]` slice (67-B frag0 header) shifted the entropy stream by 11 B — the "3 extraneous bytes on fid 2080"/"premature end" residual-warnings and much of the top-band artifact attribution were artifacts of that slice.
+Disassembly-driven correction (native block `0x26e8–0x2704` incl. — addr corrected 2026-10-28 gate round 1: the old `0x2702` stop missed the second-half store at 0x26fa — in `libbl_vii_jni.so`, exhaustive store sweep over `0x230c–0x2760`): **frag0's "11 extra bytes" are TRAILING, not leading.** Every fragment's header is 56 B; frag0 datagrams append 11 trailing ASCII metadata bytes at `d[len-11:len]` (e.g. `-0214,-0894`; natively stashed at `slot+0x1000a4..0x1000af`, ring slot stride `0x1000b0`). The previously documented `page0 = d[67:]` slice (67-B frag0 header) shifted the entropy stream by 11 B — the "3 extraneous bytes on fid 2080"/"premature end" residual-warnings and much of the top-band artifact attribution were artifacts of that slice.
 
-- REQ-BOL-004 text amended (page0 = `d[56:len-11]`, `cnt==1` → `size-11` B; framing totals unchanged: frag0 datagrams stay 1091 B).
+- REQ-BOL-004 text amended (page0 = `d[56:len-11]`, `cnt==1` → `size-11` B *(corrected 2026-10-28, gate-1 round 1 V4-K5/V3-C5: `size` B — the datagram is 56+size+11 so the tail sits past the page end; the `size-11` reading would have called every conforming cnt==1 frame malformed)*; framing totals unchanged: frag0 datagrams stay 1091 B).
 - Code: `boliu.py` `FRAG0_HDR=67` removed → `FRAG_HDR=56` + `FRAG0_TAIL=11`, slice updated; `fake_device.py` + all four test `fragment()` builders emit the wire-exact layout; `test_fakedevice_integration` page0 slice updated. Suite: 96/96 after the change.
 - Offline tape re-verification (corrected recipe): see `analysis/artifacts/frag0_layout_2026-10-27/` (per-frame djpeg warnings old-vs-new slice at 640×480; top-band metrics old-vs-new).
 - OPEN items: (1) the 11-B tail's meaning — ASCII sensor-value-like strings (candidate link to the open heartbeat "drift word" question; would give the wire a sensor channel — arc42 §10b previously recorded "no sensor channel on this unit" and that needs a re-check / candidate REQ-BOL-011 to surface `tail` in an event field); (2) `cnt==1` frag0-tail arithmetic is derived, not live-validated (no cnt==1 frame in any tape); (3) page0-tail behavior at `size < 1024` mid-frames not yet observed.
-- Note: the 7 short `[0x93][01]` control datagrams (58–67 B, body `02 02 00 01` + fid-triple, no fragment fields) documented by the same recounted tapes are NOT fragments and stay out of REQ-BOL-004 parsing (they hit `malformed`/too-short paths).
+- Note: the 7 short `[0x93][01]` control datagrams (58–67 B, body `02 02 00 01` + fid-triple, no fragment fields) documented by the same recounted tapes are NOT fragments and stay out of REQ-BOL-004 parsing (they hit `malformed`/too-short paths). *(REVERSED 2026-10-28, gate round 1 validator 2: they ARE fragments — short last pages, `len == 56 + size−(cnt−1)·1024`; see the "gate round 2" amendment below.)*
+
+## Amendment 2026-10-28 — REQ-BOL-004 naming note (no behavioral change): fragment `u32@8` is a ring-slot id
+
+> *(REFINED 2026-10-28, gate round 2 validator 3: the ring-slot reading holds **only under
+> ping-only delivery**; canonically `u32@8` is the frame id — monotonic under the app's
+> report mode and equal to the EF-02 report fid (2105/2111, 830/869) — with
+> `u16@48` high byte = **(frame id − 1) mod 2** (alternation bit, 38 710/38 727 across all
+> tapes), and `u32@24` = previous frame id. Detailed record: doc-04 §9.10 + §9.9 G.)*
+
+Live confirm session on fresh hardware (`analysis/artifacts/live_confirm_2026-10-28/`, doc-04 §9.10):
+the fragment header's `u32@8` (and its duplicate @16) cycles within a tiny set — {1,2} today (~29
+frames per slot, each frame with a DIFFERENT size), {1,2,3} in the 2026-10-27 tape — i.e. it is a
+native **ring-buffer slot id**, not a monotonic frame id. Cross-check: `u16@48` high byte
+(`d[49]`) == (frame id − 1) mod 2 in 60/60 live and 54/55 archived frag0s. Under the app's
+report mode `u32@8` is monotonic — the EF-02 `fid` IS this identifier (round-2 reversal).
+
+- REQ-BOL-004's field name `frame_id` stays (implementation terminology), with this comment-level
+  clarification; **the `(frame_id, size)` reassembly key already in REQ-BOL-004/010 is required**
+  and is what makes small-cycling (ping-mode) ids safe — no code change, suite 96/96 *(98/98
+  after the round-2 short-page fix)*.
+- Same session validates the amended frag0 slice end-to-end on live hardware: **60/60 wire
+  cycles complete; all 58 distinctly-keyed decodes djpeg-clean at 640×480**, MCU-row edge
+  spikes ≤ 1.12 luma, delivery 3.91 fps (ping-serve band now 3.43–3.91 across n=3 sessions).
+  Prototype e2e on the real tape: 1892 fragments / 60 frame_completes / 0 malformed;
+  58/59 independent rebuilds byte-match pushed JPEGs. Edge case found: two cycles sharing
+  `(slot, size)` within the LRU window overwrite silently (benign; doc-04 §9.10).
+- Gate-1 follow-up corrections (addresses only): native stash block is `0x26e8–0x2704` incl.
+  (`subs r0,#56` @0x26e2, second-half store @0x26fa); EOI `strh` @0x266c (docs updated).
+- New datagram observation: the 7 short 58–67 B `[0x93][01]` control datagrams of 2026-10-27 did
+  NOT appear on this boot (0 in 15 s) — *(superseded same day: they are short LAST-page fragments,
+  not control datagrams; the correct statement is that no last page under 12 B occurred this
+  boot — doc-04 §9.9 F.4 / §9.10).*
+- Harness note (2026-10-28, gate-3 round 1): the test suite binds the hard-coded loopback
+  source port 127.0.0.1:1234; an external occupant of that port makes ~33 tests fail with
+  bind OSError (environment flake, no code regression — verified by gate-3 validator).
+  Future harness work should bind port 0 with a stream_port override or catch and note.
+
+## Amendment 2026-10-28 (gate round 2) — REQ-BOL-004: the "short control datagrams" were SHORT LAST PAGES; <68-B blanket gate was dropping real fragments (bug fixed)
+
+Gate round 1, validator 2 (own_session tape bookkeeping audit) proved 10/10 short
+`56+remainder` datagrams across all three tapes (own_session ×3, live_now ×6, session_start5 ×1)
+are **last-page fragments** (`len == 56 + size-(cnt-1)·1024`), not control datagrams — every one
+under the blanket `<68 B` gate, i.e. the prototype dropped a real fragment (and its frame became
+incomplete) whenever the final page was < 12 B.
+
+- Spec: REQ-BOL-004 floors are now **per index** (frag0 = 68 B = 56+1+11; idx>0 = 57 B = 56+1);
+  the "7 short control datagrams" open question is **closed** (they are fragments); fragment
+  totals across the 2026-10-26 tapes correct to **34 869** (22 158 live_now + 12 711 session_start5).
+- Code: `_handle_fragment` parses fields after a ≥50-B floor, then applies the per-index floor;
+  the zero-page frag0 test (67 B → `too_short`) unchanged; two new tests
+  (`test_short_last_page_fragment_is_accepted` — 59-B last page completes the frame with the
+  correct 3-B page bytes; `test_short_nonlast_fragment_is_still_malformed`). **Suite 98/98.**
+- e2e on the archived own_session tape: the fixed transport completes **55/55 blocks**
+  (previously 52 — the 3 shorts were the missing last pages), 1966 video_fragments
+  (every 0x93/01 datagram), 0 malformed; live_now 10/10 completes with 22 158 fragments.
+## Amendment 2026-10-28 (gate round 2) — REQ-BOL-004: the "short control datagrams" were SHORT LAST PAGES; <68-B blanket gate was dropping real fragments (bug fixed)
+
+Gate round 1, validator 2 (own_session tape bookkeeping audit) proved 10/10 short
+`56+remainder` datagrams across all three tapes (own_session ×3, live_now ×6, session_start5 ×1)
+are **last-page fragments** (`len == 56 + size-(cnt-1)·1024`), not control datagrams — every one
+under the blanket `<68 B` gate, i.e. the prototype dropped a real fragment (and its frame became
+incomplete) whenever the final page was < 12 B.
+
+- Spec: REQ-BOL-004 floors are now **per index** (frag0 = 68 B = 56+1+11; idx>0 = 57 B = 56+1);
+  the "7 short control datagrams" open question is **closed** (they are fragments); fragment
+  totals across the 2026-10-26 tapes correct to **34 869** (22 158 live_now + 12 711 session_start5).
+- Code: `_handle_fragment` parses fields after a ≥50-B floor, then applies the per-index floor;
+  the zero-page frag0 test (67 B → `too_short`) unchanged; two new tests
+  (`test_short_last_page_fragment_is_accepted` — 59-B last page completes the frame with the
+  correct 3-B page bytes; `test_short_nonlast_fragment_is_still_malformed`). **Suite 98/98.**
+- e2e on the archived own_session tape: the fixed transport completes **55/55 blocks**
+  (previously 52 — the 3 shorts were the missing last pages), 1966 video_fragments
+  (every 0x93/01 datagram), 0 malformed; live_now 10/10 completes with 22 158 fragments.
+- New nuance for round 2: session_start5 shows **2410 heartbeats in 55.3 s with 2382 ≈0.4-ms
+  gaps in dense bursts** (vs our 1.6-s cadence sessions) — heartbeat behavior under the app's
+  report-mode client needs classification; doc-04 §9.9 B nuance: ping-mode heartbeat seq stuck
+  at 1 for 9 beats.
+
+## Gate round 2 — RESULTS (2026-10-28): 5/5 favorable, ≥4/5 advance threshold met
+
+Formal record: doc-04 §9.9 G (round-2 section). Verdicts by validator (scratch reports in
+`/tmp/opencode/r2_gate1..5/verdict.md`):
+
+| # | Validator | Verdict | Canon delta |
+|---|---|---|---|
+| 1 | short-page fix (all four tapes replayed, adversarial shapes, spec↔code) | **CONFIRM** | 0 violations on 36 835 type-1 datagrams; all 125 pushed JPEGs byte-match; re-push nuance: own_session = 51 keys + 4 late-retransmit re-pushes (benign) |
+| 2 | decode-claims recount (rebuilt 60/60 live + 55/55 own_session, djpeg zero-warning) | **PASS with 5 wording corrections** (all applied) | burst = 85 pages + 1 dup = 86; 60 frags + 2 pings = 62 client datagrams; MCU metric pinned: int-rounded row means 58/58 ≤ 1.0 (float 57/58 ≤ 1.167); "short" = 57..67-B band only |
+| 3 | ring-slot semantics (38 727 datagrams, 4 tapes) | **CONFIRM with refutations** | **reversal**: canonically `u32@8` = frame id — monotonic under the app and IS the EF-02 report fid (2105/2111, 830/869); ring cycling {1..3} is ping-only; `d[49]` = (id−1) mod 2 alternation bit (38 710/38 727); `u32@24` = previous frame id |
+| 4 | docs coherence sweep (canon + formatting + cross-refs) | **CONFIRM with 14 fixes** (all applied) | fps band 3.43–3.91; suite 98/98; 78 268 total; addresses 0x2704/0x266c; REQ-BOL-005 semantics row |
+| 5 | heartbeat bursts (session_start5 anomaly) | **CONFIRM (classification ≈95 %)** | storms = byte-identical TX re-submits (seq frozen, 1445 distinct MAC seq over 2415 frames) toward a STALE socket, anchored on the 1.6-s grid, only in no-active-client eras; seq resets on client registration, advances with EF-08 |
+
+- **No shipped code fix was refuted**; the two semantic refinements (frame id / alternation bit;
+  heartbeat storm classification) and the wording corrections went into doc-04, arc42 §10b.4,
+  AGENTS.md, REQ-BOL-004/005 rows, artifact READMEs, and `live_ab.py` (per-index floors).
+- Key upgrades rejected on evidence: `(slot,size,cnt,q)` key (split nothing — cnt/q are
+  frame-constant; colliding pairs agree on both); LRU 16 retained (pending peaks 1–2, cap
+  never binds at 8/16/32).
+- Open after round 2 (round-3 candidates): H-1/H-2 (needs user's sudo power-save test),
+  sensor-tail REQ-BOL-011 decision, live `cnt==1` observation, heartbeat settle-experiments
+  (client-kill + 60 s monitor capture; crafted `EF 08 08 00 [u32=12345]` probe).
+
+## Amendment 2026-10-28 (evening) — H-1 decider: RF monitoring proves the report-mode halt is DEVICE-side; second app gold tape
+
+Artifacts `analysis/artifacts/app_session_2026-10-28/` (README = full numbers),
+record in doc-04 §9.11. Two sessions, same boot:
+
+- **App tape #2 (lossless + screen + logcat):** bootstrap = REQ-BOL-009 exact; **16.66 fps**
+  (band now 16.1–16.7); **zero device stalls visible to the app** (max inter-fragment gap
+  0.143 s vs our client's ~0.5 s) — ping-mode burstiness is a client-condition property;
+  reports 27.9/s in **~31/s single-report bursts (median 1/burst, 32.7 ms interval —
+  the 2026-10-26 "8.78 bursts/s × ~3.2" was the long-session regime)**; 122× 40-B empties
+  are burst-correlated with fragments (median 30 ms), concentrated at bootstrap.
+- **Session B (our client under mon1 RF):** 15 frames at **14.90 fps intra-burst**, then
+  the halt — and RF shows the device **stopped transmitting fragments for ~41 s** while
+  our reports (27/s, 0 malformed) and its heartbeats (1.6 s) continued. Client-side causes
+  (loss/power-save/driver) all excluded in one experiment. Variant probe
+  (completion-correlated empties, `probe_empty.py` archived): 2 frames, no unlock.
+- H-2 deprioritized: the shipped app holds **no Wi-Fi lock** (static DEX evidence, doc-04
+  §9.9 G item 6).
+- **Next H-1 lever:** derive the app's **report state machine** (mixed record shapes
+  16/20/24 B, 1..3 records, states 1/0/3, partial bitmasks at reassembly moments) offline
+  from tape #2, replay live, then gate round 3. No spec/code change in this entry
+  (live-probe tooling only); REQ-BOL-008 note updated with the RF result.

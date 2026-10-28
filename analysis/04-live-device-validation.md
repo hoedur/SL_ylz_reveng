@@ -2,7 +2,7 @@
 
 **Status:** empirical results from live probing of the actual otoscope unit on 2026-10-22/23, cross-checked
 against static APK knowledge. Read together with `01-arc42-architecture.md` §10/§10a (mandatory corrections
-proposed in §8 below — **not yet applied**).
+proposed in §8 below — approved & applied 2026-10-24; further corrections 2026-10-26/27 in §9.5–§9.9).
 
 **Device under test:** SL+ ear-cameras unit, IP `192.168.169.1` (WiFi AP, gateway of DHCP to client
 `192.168.169.2` on `wlan1`, MAC `00:60:b3:b2:91:88`), device MAC `f4:42:50:af:d0:30`.
@@ -81,7 +81,7 @@ the shipped `analysis/artifacts/jhdr_Q*.bin` files are 607 bytes = over-extracti
 Each head is `FFD8 FFE0(APP0) FFDB(DQT) FFDB FF C0(SOF0: 640×?) FFC4(DHT)×N FFDA(SOS)`. The dispatch compares the device-announced
 quality against exactly `05 0a 19 32 4b 64` (= 5,10,25,50,75,100 — the constant table sits right after the
 `_len` symbols @ `0x5a58`) and `memcpy`s the matching header to the frame buffer (`inst+0xa4`), appending
-`0xFF 0xD9` (EOI) after the last fragment (`movw r1,#0xd9ff; strh` @ `0x266a`). So the **device never sends a
+`0xFF 0xD9` (EOI) after the last fragment (`movw r1,#0xd9ff; strh` @ `0x266c`, corrected 2026-10-28 gate-1). So the **device never sends a
 JPEG header**; the phone-side supplies DQT/DHT/SOF from the embedded table based on the announced quality.
 `libjpeg-turbo212.so` is a stock libjpeg decode API (no custom symbols).
 
@@ -92,41 +92,48 @@ streams fragments `192.168.169.1:1234 → phone port`:
 
 ```
 [93][01][len LE16]          ← 4-byte transport header, len == whole datagram
-[52-B field block / 56-B data boundary]  ← offsets below; frag0 header = 67 B (incl. 15-B extension)
+[56-B fragment header]      ← every fragment (incl. frag0); corrected 2026-10-27 §9.9 D
 [1024 bytes scan data]      ← exactly, except the last fragment of a frame
 ```
 
 **Authoritative fragment field map** (offsets **within the UDP payload**, i.e. including the 4 transport
-bytes; verified byte-for-byte on the 2026-10-24 capture `artifacts/raw2.bin`, 29/29 frames consistent):
+bytes; verified byte-for-byte on the 2026-10-24 capture `artifacts/raw2.bin`, 29/29 frames consistent)
+— **amended 2026-10-27 (§9.9 D): every fragment's header is 56 B; frag0's 11 metadata bytes are
+TRAILING ASCII at `d[len-11:len]` (candidate sensor readouts — §9.9 F), page0 = `d[56:len-11]`. The
+"67-B frag0 header / rows 56..66" reading below is retracted.**
 
 | off | type | meaning | observed |
 |---|---|---|---|
-| 0..3 | — | transport: `0x93`, type=1, len LE16 == datagram length | frag0=1091, mid=1080, last=52+r |
+| 0..3 | — | transport: `0x93`, type=1, len LE16 == datagram length | frag0=1091, mid=1080, last=56+r |
 | 4..7 | — | fixed signature `02 02 00 01` (= body of the *phone's* `build_send_ack` too) | const |
-| 8..11 | u32 | frame alternation id (1 / 2) | flips per frame |
+| 8..11 | u32 | frame id — canonical (round 2, 2026-10-28): monotonic and equal to the report-mode fid under the app; cycles in a small ring {1..3} under ping-only delivery | flips per frame |
 | 12..15 | u32 | 0 | const |
 | 16..19 | u32 | duplicate of frame id | matches [8] |
-| 20..31 | — | 0 | const |
+| 20..23 | u32 | 0 | const |
+| 24..27 | u32 | previous frame id (`max(d8−2, 0)` exact on ping tapes — round-2 validator 3) | |
 | 32..35 | u32 | **fragment index**, 0-based | 0..cnt−1 |
 | 36..39 | u32 | **fragment count** = `ceil(frame_size/1024)` | 22 for 21 962 B ✓ |
 | 40..43 | u32 | **frame size in bytes** | 14059..33634 |
 | 44..45 | u16 | width = 640 (`0x0280`) | const |
 | 46..47 | u16 | height field = 480 (`0x01E0`) — **the REAL raster height** (CORRECTED 2026-10-27: the native decoder patches the head's SOF0 height to this value per frame, doc §9.8; the earlier "misleading/bogus, real 640×360" reading was wrong — see §9.8) | const |
-| 48..49 | u16 | quality/status word: low byte = quality (`0x19`=25, `0x4b`=75 …), high byte mirrors frame id−1 | 0x004b / 0x014b |
+| 48..49 | u16 | quality/status word: low byte = quality (`0x19`=25, `0x4b`=75 …), high byte = **alternation bit = (frame id − 1) mod 2** (38 710/38 727 across all tapes — round-2 validator 3) | 0x004b / 0x014b |
 | 50..51 | u16 | 2 | const |
-| 52..55 | u32 | frag0 only: `0x0438000b` — low u16 = **11** = extra-byte count, high u16 = 1080 (`0x0438`) | 0 elsewhere |
-| 56..66 | — | frag0 only: **11 varying extra bytes** — purpose unknown | varies |
-| 56/67.. | — | page data: frag0 from datagram byte **67** (1024 B), others from byte **56** (1024 B, last = remainder) | |
+| 52..55 | u32 | frag0 only: `0x0438000b` — low u16 = **11** = trailing-byte count, high u16 = 1080 (`0x0438`) | 0 elsewhere |
+| 56.. | — | page data: **every** fragment carries its page from byte 56 — frag0: `d[56:len-11]` = 1024 B (datagram 1091 = 56+1024+11 tail), others 1024 B, last = remainder | |
 
-Datagram budget (constant per frame): frag0 = **1091** (= 67+1024), mid = **1080** (= 56+1024),
-last = 56+remainder. Σ(overhead) = 67+20·56+56 = **1243** for cnt=22 — verified identical on **all 29
-frames** in `raw2.bin` (overhead distribution: `{1243: 29}`); Σ(data) = declared `size` exactly.
+Datagram budget (constant per frame): frag0 = **1091** (= 56+1024+11), mid = **1080** (= 56+1024),
+last = 56+remainder. Σ(overhead) = (22×56)+11 = **1243** for cnt=22 — verified on the 2026-10-24
+capture and the gate recount. Σ(data) = declared `size` exactly.
 
-Datagram budget (constant per frame): frag0 = **1091** (= 67+1024), mid = **1080** (= 56+1024),
-last = 56+remainder. Σ(overhead) = 67+20·56+56 = **1243** for cnt=22 — verified identical on **all 29
-frames** in `raw2.bin` (overhead distribution: `{1243: 29}`); Σ(data) = declared `size` exactly.
+*(The paragraph below was duplicated verbatim; the duplicate is removed. The old-slice arithmetic
+"67-byte header … Σ equals size" demonstrated Σ(data)==size — a result that survives the slice
+correction, though its decomposition was retracted: the first datagram is 56-B header + 1024 B page
++ 11 TRAILING bytes, which were subtracted in the old sum.)*
 
-Verified arithmetic per frame: with the first fragment treated as a 67-byte header (52 common + 15 frag0 extension) + 1024 B and the rest as 56-byte header + remainder, Σ(datalen) equals the header `size` field exactly in four legacy frames: 14059 / 20932 / 33518 / 33634 ✓, and all 29 frames of the 2026-10-24 capture ✓. Fragments arrive **out of order** → phone reorders via per-index bitmap (the `lsrs #5 / and #0x1f / orrs` bit-set loops in `handle_mcu_msg_frag`).
+Verified arithmetic per frame: Σ(datalen of pages) equals the header `size` field exactly in four
+legacy frames: 14059 / 20932 / 33518 / 33634 ✓, and all 29 frames of the 2026-10-24 capture ✓.
+Fragments arrive **out of order** → phone reorders via per-index bitmap (the `lsrs #5 / and #0x1f /
+orrs` bit-set loops in `handle_mcu_msg_frag`).
 
 In the ~40 s capture: 101 big fragments = **4 complete frames** ~0.6–0.1 fps under the burst-start scheme.
 
@@ -209,6 +216,10 @@ jpeg = jhdr_Q<q>.bin (605 B, from libbl_vii_jni.so; q = payload datagram's byte 
 - Quiet libjpeg decode, correct 640×360 geometry **and colorimetry** for every captured
   frame with its announced head (frame0 + Q25 head → warm, contrast-correct render;
   the Q100-head render of the same payload is uniform grey fog — lum std 1.4 vs 43).
+  *(pre-§9.8 wording: this held for the then-unpatched 360-canvas on PIL, which is
+  warning-blind; under djpeg the 360-canvas warns 4.7–11.2 kB — §9.8; the wire raster
+  is 640×480 with a per-frame SOF0 patch, and the PNG renders of this section were
+  built from the old `d[67:]` page0 slice)*.
 - The "always Q100" advice and "the announced quality byte is 0x4b and does not map"
   from §5b are **retracted** — they were artifacts of the broken tails.
 - Negative results from the earlier hunt remain valid: XOR-constant sweep (256 keys),
@@ -218,18 +229,28 @@ jpeg = jhdr_Q<q>.bin (605 B, from libbl_vii_jni.so; q = payload datagram's byte 
 - FOSS client (prototype) implements exactly this rule: `JpegHeaderTable{5,10,25,50,75,100}`
   over the six 605-byte data heads + sticky fallback (initial Q100); see
   `prototype/docs/ARCHITECTURE.md` REQ-BOL-005/006 (amendment) — **prototype-validated**
-  code + 72 tests, pending one live A/B against the app (device was off).
+  code + 72 tests *(2026-10-28: suite now 98/98 after the short-last-page round — see
+  coordination log)*, pending one live A/B against
+  the app (device was off).
 
 **Working recipe** (validated on 29/29 frames of the 2026-10-24 capture **and** all 4 legacy
 `artifacts/frame0..3.bin`):
+
+> **Historical text, superseded (2026-10-24 late + 2026-10-27):** the correct rule is the
+> per-frame-quality recipe above (§5b-2 opening; the announced q byte IS the selection key)
+> and, since the 2026-10-27 round-0 gate (§9.9 D), the page0 slice is
+> `d[56:len-11]` with the head's SOF0 patched per frame to 640×480 (§9.8). The Q100-only
+> block below is retained because it explains *why* the original Q-header attempt failed
+> (extraction bug + mis-offset reassembly) — it is NOT a working recipe anymore.
 
 ```
 jpeg = artifacts/jhdr_Q100.bin  +  Σ fragment-page data (1024 B each, last one short)  +  FF D9
 ```
 
-- Decodes to a **640×360 RGB** camera image (PIL / stock libjpeg). The "scan-data transform" that was
+- Decodes to a **640×360 RGB** camera image *(2026-10-24 wording; the correct raster is
+  640×480 with SOF0 patch — §9.8)* (PIL / stock libjpeg). The "scan-data transform" that was
   hunted in §7 is a non-issue: the reason yesterday's Q-header attempt failed was a **wrong header** and
-  a mis-offset reassembly (67-byte frag0 header including the 15-byte extension, data off by the 11 extra bytes — now pinned by §4).
+  a mis-offset reassembly (the frag0 "11 extra bytes" are trailing, not leading — pinned by §4/§9.9).
 - **Q100 header works while the announced quality byte is 0x4b (=75).** Q5..Q75 all fail with
   "broken data stream". Reading: the finer Q100 quantization table tolerates the actual coefficient
   magnitudes; i.e. empirically the device streams at the Q100 table. The FOSS client should simply
@@ -247,9 +268,9 @@ bit-reverse, nibble-swap, 16-bit byte-swap — none decode; none needed.
 ## 6. What does *not* match the current arc42 doc / component map
 
 1. **Chip family:** doc says "Beken" + UDP 7080 + TCP 2271 gyro; live device is **Bouffalo Lab BoliU**, UDP-only, cmd/data port **8800**, no TCP anywhere.
-2. **Video framing:** doc claims ≤1472-byte fragments with `picId@2/pkType@3` into a 102400-byte buffer. Actual BoliU wire: ≤**1091**-byte datagrams `[93][01][len16]` + 56-byte fragment header (67 on frag0, incl. 15-byte extension) + **1024-byte** pages; frame size announced per frame; fragment count/size/idx in the header; JPEG headers are **not transmitted** but inserted phone-side; **decode uses the head matching the announced quality byte (low byte of the u16 @48; §5b-2)**, real resolution 640×360.
+2. **Video framing:** doc claims ≤1472-byte fragments with `picId@2/pkType@3` into a 102400-byte buffer. Actual BoliU wire: ≤**1091**-byte datagrams `[93][01][len16]` + 56-byte fragment header on every fragment (frag0 additionally carries 11 trailing ASCII bytes — amended 2026-10-27, §9.8/§9.9) + **1024-byte** pages; frame size announced per frame; fragment count/size/idx in the header; JPEG headers are **not transmitted** but inserted phone-side; **decode uses the head matching the announced quality byte (low byte of the u16 @48; §5b-2)**, real raster 640×480 (SOF0-patched per frame, §9.8).
 3. **Control commands:** the two-byte `{0x20,0x36}` datagrams are the *Beken Java* protocol and are ignored by this device; the working control is `EF 00 04 00` @ UDP 8800 (payload effectively unvalidated — any datagram to 8800 re-arms streaming, §5), plus the `EF 02…` ack and `EF 10…` queryinfo channel.
-4. **Heartbeat/orientation:** doc's TCP 2271/`CmdDataServer` doesn't exist here; a 16-byte `type-4` UDP beat every 1.6 s exists instead (drift word **not accelerometer** — see §7.2).
+4. **Heartbeat/orientation:** doc's TCP 2271/`CmdDataServer` doesn't exist here; a 16-byte `type-4` UDP beat every 1.6 s exists instead (drift word **not accelerometer** — see §7 item 2).
 
 ## 7. Open questions / retest list — status after the 2026-10-24 session
 
@@ -258,19 +279,25 @@ bit-reverse, nibble-swap, 16-bit byte-swap — none decode; none needed.
 3. **Scan-data transform** — ✅ SOLVED, was a phantom (§5b): JPEG frames decode with the
    **announced-quality head** (605 B, from the .so) + pages + `FFD9` (corrected rule §5b-2;
    the earlier "always `jhdr_Q100`" wording was an extraction-bug artifact).
-9. **Washed-out grey video in the prototype (user report, 2026-10-24)** — ✅ root-caused (§5b-2):
+4. **Washed-out grey video in the prototype (user report, 2026-10-24)** — ✅ root-caused (§5b-2):
    2-byte over-extraction of every embedded JPEG head + prototype initially always using the
    Q100 head. Fixed in the prototype (six 605-B heads, per-frame `q` selection, sticky
    fallback); visual A/B vs the original app still needs one device-on session.
-10. **Stream choppiness (user report, ~3–4 fps effective)** — ❌ open: the original app's wire
+5. **Stream choppiness (user report, ~3–4 fps effective)** — ❌ open: the original app's wire
     behavior while streaming (ping cadence, frames-per-ping batch size, achievable fps) is
     **unmeasured** — every capture so far either caught the app idle (heartbeats only) or our
     own probes. Needs a live session: capture while the APP streams (its ping pattern),
     then sweep our client's ping interval (e.g. 90 / 40 / 20 ms) and record effective fps.
-4. **Height 480 vs "640x360"** — ✅ **re-resolved 2026-10-27 (reversal)**: the height field (480) is NOT bogus: the native decoder patches the copied head's SOF0 to (w=640, h=480) per frame (doc §9.8); the embedded template heads declare 640×360 only because the patch overwrites their SOF0. Our 640×360 output silently clipped the bottom 120 rows (which is exactly the pre-EOI "surplus entropy").
-5. **UDP 63736** — ❌ unresolved: accepts nothing (no reaction to EF packets or garbage; also nothing arrives when bound locally).
-6. **First-fragment 11 extra bytes** — ❌ purpose still unknown (11 varying bytes at payload offset 56..66, right before frag0's page data; the count is announced in the frag0-only u32 @52).
-7. Exact `TBB` type→handler map and the literal-pool pairs (`0x261c–0x263c`) — ❌ still unresolved (static-only).
+   *(✔ largely closed 2026-10-26: §9.5/§9.6 measured the app's regime — 16.1–16.2 fps,
+   report-family cadence; our regime's cadence sweep §9.2.)*
+6. **Height 480 vs "640x360"** — ✅ **re-resolved 2026-10-27 (reversal)**: the height field (480) is NOT bogus: the native decoder patches the copied head's SOF0 to (w=640, h=480) per frame (doc §9.8); the embedded template heads declare 640×360 only because the patch overwrites their SOF0. Our 640×360 output silently clipped the bottom 120 rows (which is exactly the pre-EOI "surplus entropy").
+7. **UDP 63736** — ❌ unresolved: accepts nothing (no reaction to EF packets or garbage; also nothing arrives when bound locally).
+8. **First-fragment 11 extra bytes** — ✅ **resolved 2026-10-27 (reversal)**: they are
+   **trailing**, not leading — frag0's 11 ASCII bytes sit at `d[len-11:len]` (e.g.
+   `-0214,-0894`, candidate sensor readouts), natively stashed at `slot+0x1000a4`
+   (block `0x26e8–0x2704`, incl.; gate-1 re-derivation 2026-10-28: `subs r0,#56` @0x26e2, second-half store `str r1,[r5,r2]` @0x26fa — land-byte write completes at 0x2704); the frag0-only u32 @52 (`low u16 = 11, high u16 = 1080`)
+   announces them. Purpose/parsing into a sensor channel still open (§9.9 F).
+9. Exact `TBB` type→handler map and the literal-pool pairs (`0x261c–0x263c`) — ❌ still unresolved (static-only).
 
 ## 8. Proposed changes to existing docs — ✅ approved & applied 2026-10-24
 
@@ -283,7 +310,7 @@ essentials + venv tooling) was placed into `AGENTS.md`, which is the file the ha
 - `01-arc42-architecture.md` §10: add "§10b Empirically validated live protocol (BoliU/BL384 unit)" with §§1–5 above; restate §10 Beken/7080/TCP 2271 facts as *shipped-APK-source-derived, not applicable to the BL384 unit*.
 - `01-arc42-architecture.md` §10a: the "no device-config protocol" finding gains live corroboration — but note that `BlSdk` (`BL384SDK`) is precisely the driver this device needs, so the FOSS facade must implement §3–§4 instead of Beken.
 - `02-component-map.md`: add the `192.168.169.x` live sequence diagram (8× EF000400 → fragment storm → reassembly) as a separate "physical device trace" block.
-- `03-reimplementation-proposal.md`: scope-core must implement **both** transports; put the validated UDP/8800 first-class, Beken/7080 second. **The decode path is fully specified now (§5b)**: reassemble pages, prepend `jhdr_Q100`, append EOI, decode 640×360 — no remaining unknowns for core video; heartbeat drift-word semantics and UDP 63736 remain nice-to-have.
+- `03-reimplementation-proposal.md`: scope-core must implement **both** transports; put the validated UDP/8800 first-class, Beken/7080 second. **The decode path is fully specified now (§5b)**: reassemble pages, prepend `jhdr_Q100`, append EOI, decode 640×360 — no remaining unknowns for core video; heartbeat drift-word semantics and UDP 63736 remain nice-to-have. *(superseded 2026-10-24: per-frame q; 2026-10-27: SOF0 dims patch + page0 `d[56:len-11]` slice — §9.8/§9.9.)*
 - `OPENCODE.md`/`AGENTS.md`: wiki of established facts gains the UDP-8800/EF-format essentials + note that `.venv` now also has `capstone` and `pillow` and that `arm-none-eabi-objdump` is available for THUMB disassembly.
 
 ## 9. Retest log — 2026-10-24 late session (color-fix verification + cadence sweep)
@@ -369,6 +396,12 @@ and compare the declared vs consumed scan length.
 
 ### 9.5 ✅ §9.3 executed: monitor-mode capture of the ORIGINAL app streaming (2026-10-26)
 
+> **Superseded 2026-10-26 later (lossless §9.6):** the "14.1 fps sustained" / "8.78 reports
+> per s" figures below were capture-duty artifacts; the real lossless rates are
+> 16.1–16.2 fps and 26.4/39 reports/s, and `fid` is u64 (record `recSize` 0x18/0x14/0x10
+> taxonomy §9.6-B). The §9.5 "decoded cleanly as JPEG" clause was PIL-measured
+> (warning-blind) — §9.8. Kept for the capture-setup lessons.
+
 **Setup.** `wlan1` had been renamed `wlan0` by iwd/udev. Re-association attempts failed
 ("Operation failed") because the **phone already held the single AP slot** — which enabled the
 experiment directly: the app was already streaming. `dumpcap -i wlan0 -I` (monitor) captured
@@ -396,7 +429,7 @@ Constant body magic `02 02 00 01` and constant word `0a 4b 14 2d` at @28 (after 
 
 **Decisive negative fact: the app NEVER sends `EF 00 04 00`.** Our 4-byte ping is not what
 keeps the app's stream flowing; the ~9/s EF-02 reports do (or the app's full-length stream
-poll). Yet delivery under our EF-00-04 pings was proven ping-serve-like earlier (§10b.8/§9.2)
+poll). Yet delivery under our EF-00-04 pings was proven ping-serve-like earlier (§10b.3/§9.2)
 — see hypothesis H-1 below.
 
 **Device→client extra facts.**
@@ -428,8 +461,13 @@ was on the device the whole session).
 
 Artifacts in `/tmp/opencode/` (should be copied into `analysis/artifacts/app_stream_2026-10-26/`
 when preserved): `session_start5.{pcapng,tsv}` (60 s app RESTART with full client side; t+29.3 s
-= session start; essentially lossless), `live_stream_now.{pcapng,tsv}` (45 s steady state,
-22 184 device frag datagrams + 1 806 reports, essentially lossless). Key enabler: the phone's
+`session_start5.{pcapng,tsv}` (60 s app RESTART with full client side; t+29.3 s
+= session start; near-lossless client-side, recent hourly re-audit flags later
+monitor-window loss at the device→AP leg — treat device-denominator counts with the
+§9.5 duty caveat), `live_stream_now.{pcapng,tsv}` (45 s steady state,
+22 184 device datagrams (= 22 158 fragments — all 0x93/01 datagrams are fragments, incl. the
+6 short last pages; §9.7-B recount, gate-1 V2 2026-10-28) + 1 806 client-side datagrams
+(all families), near-lossless with the same device-leg caveat). Key enabler: the phone's
 app took lease `192.168.169.2` (our old address) — capture duty was meanwhile near-total.
 
 **A. The app's full bootstrap sequence (session_start5, first 25 client datagrams):**
@@ -454,7 +492,8 @@ to the AP gateway and unrelated chatter). Session frame-id counter starts at **1
 Body = `\xEF 02 [len] 00 | 02 02 00 01 | count u32 | 12×00 | 0A4B142D @24 | 00×4 | records… | 00×8`.
 Record = `fid u64 LE | state u32 | recSize u32 | [mask]` with
 recSize `0x18` = 24 B (u64 mask), `0x14` = 20 B (u32 mask — e.g. `ffffffff` for cnt ≤ 32
-pages), `0x10` = 16 B (no mask). Forms observed (n=1060 in 45 s):
+pages), `0x10` = 16 B (no mask). Forms observed (n = 1 771 EF-02 datagrams in 45 s; the table
+sums to 1 771 — earlier "n=1060" was a form-sum slip):
 (64,1)=1001 · (60,1)=306 · (40,0)=146 · (104,3)=84 · (96,3)=84 · (88,2)=71 · (76,2)=48 · (80,2)=31.
 Empty (40,0) reports occur steadily mid-stream (~2–3/s), not just at bootstrap.
 State values seen: 1=complete, 0=in-flight (with partial mask), 3=not-running (no mask).
@@ -530,23 +569,32 @@ dispatcher plus a helper at `0x2640..0x2734` implement the accept path; semantic
 | Unknown q | `0x2696 bne 0x26e8` → head-copy skipped, **sticky previous head** | ✅ (`header_for` → None → caller keeps last; initial Q100) |
 | Page area | pages memcpy'd into one contiguous buffer at `idx*1024` (`0x2706-272c`), idx from d[32] | ✅ (`payload = pages[i] for i in range(cnt)`) |
 | Retransmit | re-copy into the *same* destination → **last-version-wins overwrite** | ✅ (`pages[idx] = page` overwrite) |
-| EOI | `0x2664-266e` `movw r1,#0xd9ff` + `strh`, appended **only when idx == cnt-1**, at payload end | ✅ (`+ FF D9` at completion) |
-| frag0's 11 extra header bytes | `0x26e8 sub r0, r9, #11` (r9 = u16@d[2]) + u32 read at d[slen-4] and 8-B read at d[slen-67] — **11 bytes arithmetically skipped as metadata** | ✅ (page0 = d[67:], REQ-BOL-004) |
+| EOI | `0x2664-0x266c` `movw r1,#0xd9ff` + `strh` @0x266c (addr corr. 2026-10-28 gate-1), appended **only when idx == cnt-1**, at payload end | ✅ (`+ FF D9` at completion) |
+| frag0's 11 extra header bytes | `0x26e8 sub r0, r9, #11` (r9 = u16@d[2]), then word read at `d[len-4]` + 8-B read at `d[len-11]` → the **last 11 contiguous bytes are stashed as metadata** (block `0x26e8–0x2704` incl. — addr corr. 2026-10-28 gate-1 —, landing zone `slot+0x1000a4`); page data itself starts at `d+56` (set @0x232c) for **every** fragment | ✅ amended REQ-BOL-004 (corr. 2026-10-27: page0 = `d[56:len-11]`; the earlier `d[67:]` "leading 11 bytes" reading was inverted) |
 | frag0 length sanity | d[2] (u16) is read as the datagram's own length field | (informational; not modeled by us) |
 
 Conclusion A: **the app's reassembly is byte-equivalent to ours on every semantic that
-exists**: same q byte, same head selection with sticky fallback, same page slicing, same
+exists** *(as scoped amended 2026-10-27 — with the corrected page0 slice from the round-0
+gate, §9.9 D; and the accept-path divergence on page0-loss frames (§9.8's trailing
+validator-5 analysis) remains a
+deliberate prototype-hardening, not an equivalence claim)*: same q byte, same head selection with sticky fallback, same page slicing, same
 order, same overwrite policy, same EOI append at completion.
 
 ### B. Empirical tape validation (lossless app captures, §9.5/§9.6)
 
-* `live_now.tsv` (45 s steady state, 22 152 device datagrams): **page-boundary arithmetic
+* `live_now.tsv` (45 s steady state, 22 158 fragment datagrams incl. 6 short last pages —
+  all 0x93/01 datagrams are fragments, gate-1 V2 2026-10-28): **page-boundary arithmetic
   validated per datagram — 0 anomalies** over every (idx, cnt, size) combination:
-  `idx==0 → d[67:], 1024 B; idx==cnt-1 → d[56:], size-(cnt-1)*1024 B; else d[56:], 1024 B`.
+  `idx==0 → d[67:], 1024 B; idx==cnt-1 → d[56:], size-(cnt-1)*1024 B; else d[56:], 1024 B`
+  *(slice as originally stated; superseded 2026-10-27 — §9.9 D: same zero-anomaly counts
+  hold for the wire-exact page0 = `d[56:len-11]`)*.
   Zero exceptions.
 * Complete frames: 10 of 731 announced fids had *all* pages captured (the monitor capture
   drops ~30 % of datagrams; app-side completeness is unaffected — see §9.5 duty notes).
-  **All 10 decode cleanly in PIL** — no libjpeg warnings, exact 640×360, q=75 ×6 / q=50 ×4
+  **All 10 decode cleanly in PIL** — no libjpeg warnings *(PIL is warning-blind; the
+  djpeg-level verdict for these frames is in `analysis/artifacts/frag0_layout_2026-10-27/`:
+  10/10 clean under the corrected slice at 640×480)*, exact 640×360 at the old 360-canvas
+  *(pre-§9.8)*, q=75 ×6 / q=50 ×4
   (PNG samples archived in `analysis/artifacts/sof_canvas480_2026-10-27/pngs360/` —
   note these are the pre-REQ-BOL-010 360-canvas renders; the corrected 480-canvas
   renders live in the sibling `pngs/` directory).
@@ -607,7 +655,7 @@ two validators produced decisive refutations, both verified independently:
    → slot[158], w=d[44] → slot[156] @0x240c/0x2414) and writes them **BE16 into the head
    copy's SOF0 at head+145/147** (@0x26dc/0x26e4). All six template heads declare
    640×360 (`01 68 02 80`); the wire announces **w=640, h=480 on 1 061/1 061 frag0s**.
-   So "h=480 is bogus" (§4 line, §5b-2 item 4) was wrong — **the device streams 640×480,
+   So "h=480 is bogus" (§4 field map's earlier note, §7 item 6) was wrong — **the device streams 640×480,
    and our 640×360 canvas output silently clipped the bottom 120 raster rows.**
 
 **Resolution — the "surplus entropy" is explained:** rebuilding every complete tape frame
@@ -638,7 +686,8 @@ the START of the scan** — the device-side encoder page/ring reuse, not any cli
 > wrong page0 slice (`d[67:]`, 11-B entropy shift). Under the wire-exact slice
 > (`d[56:len-11]`) the top-band deltas collapse (2303: Δ116→19; 2080: Δ100→12;
 > 2675: Δ95→31) and every V2-style MCU-row edge spike vanishes (y=8/16/24 spikes up to
-> 39.0 → ≤1.35). The user's stripes are most plausibly the prototype's own slicing bug;
+> 39.0 → ≤1.35 at the former spike rows; global new-slice edge max ≤1.87 — see the
+> README's column note). The user's stripes are most plausibly the prototype's own slicing bug;
 > the native app decodes the correct slice. Full table:
 > `analysis/artifacts/frag0_layout_2026-10-27/README.md`; gate record: §9.9.
 Supported by the native side's own exposure (validator 5, D-B): the app's completion scan
@@ -681,7 +730,7 @@ Five validators (general-purpose agents, adversarial briefs; tallies in the sess
 - **V1 (SOF0/frag0 native claims): C1–C4 CONFIRM + C5 REFUTED** — the decisive find:
   **the frag0 "11 extra bytes" are TRAILING, not leading.** Every fragment header is
   56 B; frag0 datagrams = 56 + 1024 page + 11 trailing ASCII bytes (`-0214,-0894`),
-  which the native helper deliberately stashes (`0x26e8–0x2702` → landing zone
+  which the native helper deliberately stashes (`0x26e8–0x2704`, i.e. through the 0x26fa store → landing zone
   `slot+0x1000a4`, slot stride `0x1000b0`). The documented `page0 = d[67:]` slice
   (67-B frag0 header) shifted the entropy stream by 11 B; the prototype has been
   decoding every frame 11 bytes off. Also: helper base sign corrected (caller slot
@@ -694,10 +743,14 @@ Five validators (general-purpose agents, adversarial briefs; tallies in the sess
   was derived **under the wrong slice** — both are superseded by the re-decode below.
 - **V3 (surplus explanation): CONFIRM** with corrections: template heads are
   **4:4:4 (sampling `01 11 02 11 03 11`) → 8×8 MCUs** (80×60@480 / 80×45@360), which
-  makes "bottom 120 rows = 25 % of entropy" exact; measured surplus/size mean 0.2447 /
-  median 0.2496 (n=22 frames); byte identity `E360 = (C480−C360)+E480` holds exactly
-  where evaluable; fragment recount **34 869 → 34 862** (+7 short `[0x93][01]` control
-  datagrams of 58–67 B, body `02 02 00 01`+fid-triple, not fragments); third tape
+  makes "bottom 120 rows ≈ 25 % of the raster" exact *(entropy share re-measured 2026-10-28
+  gate-1 V2: E360/size mean **0.2330**, median 0.2326, n=55 — V3's n=22 "0.2447/0.2496" was
+  the smaller app-tape sample)*; measured surplus/size mean 0.2447 / median 0.2496 (n=22 of
+  the app tape; own-session tape n=55: 0.2330/0.2326, range 0.2304–0.2474); byte identity
+  `E360 = (C480−C360)+E480` holds exactly where evaluable; fragment recount **34 869**
+  *(re-corrected 2026-10-28, gate-1 V2: the "34 862 + 7 short control datagrams" split was
+  inverted — the +7 are short LAST-page fragments — §9.9 F.4 reversal, coordination round 2)*;
+  third tape
   `session_start4.txt` adds 43 399 fragments, 0 anomalies, 12 complete frames.
 - **V4 (prototype @480 end-to-end): CONFIRM 6/6** — REQ-BOL-010 code/tests/render path
   verified byte-exact; suite 96/96 reproduced; comment/spec-text nits queued.
@@ -709,14 +762,32 @@ itself still contained the frag0 error V1 uncovered. Round 1 (below) shipped the
 
 ### B. Own-session datagram capture — retest (a) complete
 
-`analysis/artifacts/own_session_2026-10-27/` (pcapng + TSV). Ping regime: 46 complete
-frames, wire fps 3.43, familiar stall structure (26 gaps > 350 ms). Report phase:
-**26-fragment burst in the first second, then 9.8 s of zero fragments while 260 EF-02
-reports AND device heartbeats continue** — H-1 captured losslessly on the wire.
-Heartbeats followed BOTH client sockets (46844 ping socket + 51387 report socket);
-pre-association heartbeats broadcast (dst 0.0.0.0:0). Any prior artifact-frequency
-comparisons from this capture (29/46 vs 6/10 same-metric) are void — the band metric
-was old-slice-based; the striping question retires into §F below.
+`analysis/artifacts/own_session_2026-10-27/` (pcapng + TSV). *(Numbers re-measured
+2026-10-28 gate-1 validator 2; the tape's 1966 0x93/01 datagrams are ALL fragments
+incl. 3 short last pages *(short = 57..67-B band, gate-pinned; all frames also have ordinary
+sub-1024 last pages)*, so frames re-cut keyed by `(slot,cnt,size,q)` blocks — the
+slot id cycles 1/2/3, §9.10).*
+
+- Ping regime: **52 complete frames** (50 excluding 2 that need a short last page),
+  wire fps **3.88** (52 frames / 13.414 s; the earlier "46 frames / 3.43 fps" did not
+  reproduce — numerator off), stall structure **24 inter-frame gaps > 350 ms**
+  (25 counting the ping→report redirect), max 0.525 s, **0 intra-frame gaps**.
+- Report phase: **86-datagram burst in 0.232 s at redirect (85 page fragments = 2×37-frag +
+  1×11-frag frames + 1 retransmit duplicate — count pinned by gate round 2; 60 fragments
+  + 2 pings = 62 client datagrams before the first EF-02), then 9.68 s of zero fragments while
+  260 EF-02 reports (+ 6 EF-08) and heartbeats continue** — H-1 captured losslessly
+  on the wire.
+- Sockets **swapped vs the earlier text**: **51387 = ping socket** (155+2 EF-00 pings),
+  **46844 = report socket** (2× EF-00 + 2 empty + 258 progress EF-02 + 6 EF-08).
+- Heartbeats followed the client sockets **sequentially** (10 → 51387 during the ping
+  phase, then a single switch to 46844; no overlap) and pre-association heartbeats
+  broadcast (dst 0.0.0.0:0); ping-mode seq nuance: **stuck at 1 for 9 beats, then 2** —
+  ping-mode seq is not a running seconds counter (report-mode one counts 1→35, §10b.10).
+  *(2026-10-28 round-2 note: session_start5 additionally shows 2410 "heartbeats" in
+  55.3 s with 2382 ≈0.4-ms gaps in dense bursts — needs classification.)*
+Any prior artifact-frequency comparisons from this capture (29/46 vs 6/10 same-metric)
+are void — the band metric was old-slice-based; the striping question retires into
+§F below.
 
 ### C. EXP1/EXP2/EXP3 — the entire report-content surface exonerated
 
@@ -736,7 +807,9 @@ was old-slice-based; the striping question retires into §F below.
 ### D. Round 1: wire-exact frag0 slice implemented (spec-first)
 
 - Spec: REQ-BOL-004 amended 2026-10-27 (`page0 = d[56:len-11]`, `cnt==1` → `size-11`
-  B; framing totals unchanged at 1091 B) — `prototype/docs/ARCHITECTURE.md` +
+  B *(corrected 2026-10-28, gate round 1: `size` B — see coordination + ARCHITECTURE;
+  the `size-11` wording would have treated every conforming cnt==1 datagram as
+  malformed)*; framing totals unchanged at 1091 B) — `prototype/docs/ARCHITECTURE.md` +
   coordination entry.
 - Code: `boliu.py` (`FRAG_HDR=56` + `FRAG0_TAIL=11`, slice updated), `fake_device.py`
   + all four test `fragment()` builders emit the wire-exact layout,
@@ -744,7 +817,8 @@ was old-slice-based; the striping question retires into §F below.
 - Tape re-verification (`analysis/artifacts/frag0_layout_2026-10-27/`): corrected
   slice = **djpeg-clean 10/10 live_now complete frames at 640×480** (old slice: 7/10
   warn, incl. "3 extraneous bytes" fid 2080); every MCU-row edge spike (y=8/16/24,
-  up to 39.0 luma) collapses to ≤1.35; the remaining top-band mean-deltas (Δ 5–39)
+  up to 39.0 luma) collapses to ≤1.35 at the former spike rows (global new-slice edge max
+  ≤1.87 — README column note); the remaining top-band mean-deltas (Δ 5–39)
   are scene-level and not MCU-aligned. fid 2303 before/after PNGs in the artifact.
 - Consequence for §9.7-C/§9.8: the user's left/top stripes were most plausibly
   **our own 11-B entropy shift** (the shipped app decodes correctly). The wire-level
@@ -766,13 +840,215 @@ user's command, queued as the H-2 experiment); `iw` is not installed.
    experiment; then the phone-comparison round (screenrecord ground truth: does the
    phone display match our corrected decode 1:1? — expected yes).
 2. **Live visual check** that user-visible stripes are gone with the corrected slice
-   (short ping session; device stays ON).
+   (short ping session; device stays ON) — *(2026-10-28 §9.10: instrument-level pass,
+   58/58 djpeg-clean 640×480, MCU spikes ≤1.12 on fresh hardware; sample PNGs in
+   `analysis/artifacts/live_confirm_2026-10-28/pngs/` for the user's own eyes; a
+   phone-app side-by-side remains the gold check.)*
 3. The 11-B ASCII tail = **candidate sensor channel** (`-0214,-0894` reads like two
    signed axis readouts; connects to the open heartbeat drift-word question) — the
    arc42 "no sensor channel on this unit" record needs this caveat; candidate
    REQ-BOL-011 to surface `tail` in an event field (not yet implemented).
-4. Classify the 7 short `[0x93][01]` control datagrams (58–67 B, body `02 02 00 01` +
+4. ~~Classify the 7 short `[0x93][01]` control datagrams (58–67 B, body `02 02 00 01` +
    fid-triple + idx/cnt pair) — type-1 but not fragments; the parser already rejects
-   them cleanly under the ≥68 B threshold.
+   them cleanly under the ≥68 B threshold.~~ **RESOLVED 2026-10-28 (gate-1 V2 reversal):
+   they ARE fragments — last pages with a < 12-B remainder** (`len == 56 + size −
+   (cnt−1)·1024`, 10/10 across own_session ×3 / live_now ×6 / session_start5 ×1).
+   The blanket `<68 B` gate was dropping them; fixed spec-first (REQ-BOL-004 per-index
+   floors, per-index length floor: frag0 68 B, idx>0 57 B; coordination round 2,
+   suite 98/98, own-session e2e 52→55 complete blocks).
 5. `cnt==1` frag0-tail arithmetic is derived, not wire-observed (no cnt==1 frame in
-   any tape) — first live occurrence gates the `size-11` claim.
+   any tape) — first live occurrence gates the claim *(2026-10-28 gate round 1: spec
+   wording unified on `size`; doc-04 §9.10)*.
+
+### G. Gate round 1 — formal tally: 5/5 CONFIRM the wire-exact frag0 conclusion (2026-10-28)
+
+Five independent validators re-derived/disproved from raw evidence; verdicts on the
+**round-1 conclusion** (page0 = `d[56:len-11]`, 11 trailing ASCII bytes, 56-B headers,
+REQ-BOL-010 SOF0 patch, `(frame_id,size)` key):
+
+| # | Validator | Verdict | Notes |
+|---|---|---|---|
+| 1 | native `.so` re-disassembly (`handle_mcu_msg_frag` @0x230c / helper @0x2640) | **5× CONFIRM** (N1–N5) | no path reads `dgram+67`; tail stashed at `slot+0x1000a4`, never re-read. Address corrections applied: stash block `0x26e8–0x2704` incl. (`subs r0,#56` @0x26e2, second-half store @0x26fa), EOI `strh` @0x266c |
+| 2 | tape decode + bookkeeping audit (`own_session`, lossless) | **CONFIRM** | 55/55 djpeg-clean at 640×480 under the corrected slice (old slice: 41/55 warn); `E360` share re-measured 0.2330 mean (n=55); **found the short-last-page misclassification** → gate round 2 item 1 |
+| 3 | prototype end-to-end (code+tests+harness, round-trip byte-exact) | **C1–C4 CONFIRM, zero code defects** | found REQ-BOL-004 `cnt==1: size−11` spec↔code contradiction + REQ-BOL-008 zero-run typo → fixed |
+| 4 | docs consistency sweep (arith re-checked, cross-refs resolved) | **consistent**, 2 blockers + 14 minors | doc-04 §4 field map, proposal step 3, coordination duplicates — all applied |
+| 5 | stale-claims/blockers hunt (executable remnants of the old layout) | **CONFIRM the fix; 7 blockers** | `frame0..3.bin` provenance banners, tool supersede markers, "no sensor channel" caveat spread — all applied |
+
+**Every follow-up item was doc- or artifact-side; no validator refuted the frag0
+conclusion.** Two real detections (round-2 material): (1) the blanket `<68 B` gate
+drops real short last pages (validator 2); (2) `u32@8` cycles in a tiny ring under ping
+delivery — refined by gate round 2 into the canonical frame-id/alternation-bit reading
+(live session §9.10; corroborated 60/60 + 54/55 locally, 38 710/38 727 across tapes).
+
+### Gate round 2 — opened (plan)
+
+Adversarial loop continues per the user's mandate (≥4/5 to advance). Items, in
+priority order:
+
+1. **~~Short "control datagrams"~~ → RESOLVED** (fixed above, F.4; round-2 validator 1
+   CONFIRM: 36 835 type-1 datagrams re-derived with 0 violations, four-tape replay
+   byte-exact on all 125 pushed frames, adversarial-shape pass, spec↔code exact,
+   suite 98/98).
+2. **~~Heartbeat burst classification~~ → RESOLVED** (round-2 validator 5, ≈95 %):
+   the 7 storms in `session_start5` (219…694 byte-identical 16-B beats at 0.14–1.00 ms
+   gaps) sit on the phone's **stale pre-association socket** (43875) during an idle era;
+   they are anchored exactly on the 1.6-s beat grid, **seq does not advance within a
+   storm** (2382/2409 deltas = 0 — storms repeat the current beat's payload and consume
+   no seq), and 802.11-level evidence (1445 distinct MAC seq over 2415 frames) proves
+   genuine device-side resubmits. Active-client sessions are storm-free (47/47, 10/10,
+   26+1×2 singles). Surviving wording: *1.6-s nominal beat per grid tick, one datagram
+   per tick under any active client; identical-datagram TX storm (8–694×) toward a
+   stale/never-ACKing target*. seq model refined: resets to 1 on client registration,
+   **freezes at 1 when the client sends no report-mode traffic** (explains §9.9 B's
+   "stuck at 1 for 9 beats" and live_confirm), advances in step with EF-08 keepalives.
+   Cheap settle-experiments queued: client-kill + 60 s monitor capture; a crafted
+   `EF 08 08 00 [u32=12345]` probe.
+   *(Also corrected by the sweep: all `session_start5` beats go to device-sourced
+   `:1234` — 2395 → the stale socket, 15 → the fresh one.)*
+3. **Sensor-tail channel (candidate REQ-BOL-011)** — decide surface strategy for
+   the 11-B ASCII tail (`-0214,-0894`); needs real fragment evidence + a live
+   correlation test (wiggle the scope, watch the readouts).
+4. **Live `cnt==1` observation** — loses nothing until a 1024-B-single-page frame
+   appears on the wire; keep the derived `size` wording until then.
+5. **~~`(slot,size)` key-collapse edge~~ → ASSESSED (round-2 validator 3):** pending
+   keys peak at 1–2 on the real tapes (zero evictions at caps 8/16/32); all 6 real
+   collision pairs are strictly sequential (never interleaved); late-frag0 arrival
+   events (5/1/88/81 across tapes) are absorbed by the key by construction. The
+   `(slot,size,cnt,q)` upgrade splits nothing (cnt/q are frame-constant; colliding
+   pairs agree on both) — **redundant, no spec amendment needed**. Benign
+   retransmit-re-push nuance (round-2 validator 1): own_session pushes = 51 distinct
+   keys + 4 late-retransmit re-pushes of re-created keys.
+6. **H-2 power-save experiment** *(deprioritized 2026-10-28, static DEX evidence for the
+   user's hypothesis: the shipped app holds NO Wi-Fi lock — zero matches for
+   `createWifiLock`/`WifiLock`/`WIFI_MODE_*` across classes{,2,3}.dex; only 1× WifiManager
+   + 5× WakeLock/3× PowerManager (CPU). The phone streams 16 fps under default Android
+   Wi-Fi power management, so client-side power-save is unlikely to be H-1's missing
+   condition; keep as a fallback only if RF-level capture of our own report-mode session
+   shows device frames still arriving after the client-visible halt).*
+
+**Round-2 gate verdict: 5/5 favorable — round 1's frag0 conclusion and the round-2
+fixes CONFIRM; two semantic refinements reached canon** (frame-id/d49-alternation
+reading above; heartbeat storm classification). No validator refuted a shipped
+code fix; all corrections were doc-side except heartbeat wording (no code change).
+
+## 9.10 Live confirmation session on fresh hardware (2026-10-28, post round-1 fix)
+
+Artifacts: `analysis/artifacts/live_confirm_2026-10-28/` (lossless pcapng+TSV, harness,
+3 sample PNGs). Short ping-only session (`EF 00 04 00` @100 ms, 15.2 s, 150 pings) on a
+freshly power-cycled unit; wlan0 this boot, our IP 192.168.169.2.
+
+### Wire results
+
+- **1892 fragment datagrams in the amended shape**: 60 × 1091 B frag0s (56 hdr +
+  1024 page + 11 tail) + 1772 × 1080 B mids (56 hdr + 1024 page, no tail) + short
+  last pages — the gate-1 wire taxonomy reproduced on hardware from a different boot.
+- 10 heartbeats (1.6 s cadence), **no short 57..67-B last-page datagrams** this time
+  (i.e. no last-page remainder under 12 B in 15 s; ordinary sub-1024 last pages occur on
+  ~all frames; the 2026-10-27 "control datagrams" puzzle is resolved as short last
+  pages — §9.9 F.4).
+- **NEW field-map finding, REFINED by gate round 2 (validator 3):** under ping-only
+  delivery the fragment `u32@8` cycles in a small ring — {1,2} today (30 frag0s each,
+  ~29 frames per slot each with a DIFFERENT size) vs {1,2,3} in the 2026-10-27 tape —
+  and `u16@48` high byte = **(frame id − 1) mod 2** (60/60 here). Gate round 2
+  established the canonical reading across all four tapes: `u32@8` is the **frame id**
+  — monotonic AND equal to the report-mode EF-02 fid under the app (2105/2111,
+  830/869; zero decrement transitions on the app tapes 1998→2728 / 1→463) — the ring
+  cycling is a ping-delivery-only artifact; `u32@24` carries the previous frame id
+  (`max(d8−2, 0)` exact on ping tapes). The prototype's `(frame_id, size)` reassembly
+  key remains exactly what makes the cycling safe (no code change, spec wording
+  amended).
+
+### Decode results (corrected slice, djpeg)
+
+- The wire carries **60 complete frame cycles** (59 complete in the offline per-cycle
+  grouping; the transport completes all 60 — the first cycle's idx 1–12 fragments arrive
+  *before* its idx 0, an out-of-order orphan the `(slot,size)` key absorbs). Frames are
+  only distinguishable by the **(slot, size)** key; **2 cycles share a key** ((1,32473) and
+  (1,32537) — static-lens equal-size collision; payloads differ).
+- **djpeg-clean at 640×480 for all 58 distinctly-keyed decoded frames** (page0 =
+  `d[56:len-11]`, REQ-BOL-010 SOF0 patch), zero warnings.
+- MCU-row edge metric: max row-delta rows 0..31 ≤ **1.12** *(metric defn pinned after
+  gate round 2: float row means give 57/58 ≤ 1.167; with integer-rounded row means
+  58/58 ≤ 1.0 — validator 2; either way 40× below the pre-fix era's 39.0)*
+  (median 0.64; baseline jitter ≈ 0.3–0.5) — **58/58 clean**; spikes at y=8/16/24 ≤ 1.02.
+  The first **user-relevant live validation** that the old stripe artifact is gone.
+- q: 56×75, 1×50, 1×25 (boot frames small: size 12928/19700, then steady ~32.5 kB).
+- Delivery: **3.91 fps effective** (ping-regime band **3.43–3.91** across n=3 sessions:
+  3.43/3.72–3.80 (2026-10-24/27), 3.88 (own_session recount), 3.91 (this session);
+  see AGENTS.md cadence-sweep bullet), bursty as usual.
+
+### Prototype end-to-end cross-check on the live tape (2026-10-28)
+
+Feeding the 1902 archived datagrams through the actual `BoliUTransport` parse path:
+**1892 × `video_fragment`, 60 × `frame_complete`, 10 × `heartbeat`, 0 malformed** — the
+transport recovers every wire cycle incl. the byte-verified independent rebuilds
+(58/59 offline rebuilds matched pushed bytes byte-exactly; the residual is the
+first-cycle orphan-recovery bookkeeping of the offline harness, not a transport defect).
+Nuance recorded for the spec: when two cycles share their `(slot, size)` key *within*
+the 16-key LRU window, the later cycle's pages overwrite the entry without a second
+completion (silent frame replacement; benign at video rates — the LRU pruning produced
+separate pushes for both duplicate-key cycles live). Candidate future amendment, not
+implemented without user go-ahead.
+
+## 9.11 App gold capture #2 + the decisive H-1 RF experiment (2026-10-28 evening)
+
+Artifacts: `analysis/artifacts/app_session_2026-10-28/` (README with all numbers;
+lossless pcapng+TSV for both sessions, screen recording, logcat). Radio: `wlan0`
+station + pre-existing `mon1` monitor; device ON, host DISCONNECTED afterwards.
+
+### A. App gold capture (lossless, 74.2 s, screen+logcat synchronized)
+
+Second app tape on a fresh boot; every §9.5/§9.6 headline reproduces and extends:
+
+- **Bootstrap = REQ-BOL-009 byte-exact**: 2× `EF 00 04 00` (+0.00/+0.10), first
+  fragment +0.093 s, first report +0.203 s.
+- **16.66 fps** fid slope (892 frag0s, fid 1..942); q 843×75/46×50/2×25/1×10;
+  w,h 640×480 on 100 % of frag0s; 6 short last pages in 27 189 fragments; 0 dropped
+  packets in capture.
+- **The app sees ZERO device stalls** — 6 gaps >100 ms, max 0.143 s, vs our ping-mode
+  client's ~0.5-s stalls per burst (§4a/§9.9 B). Ping-mode "bursty delivery" is a
+  **client-condition property**, not a device cadence law.
+- Report regime (fresh session, this boot): 1596 EF-02 = **27.9/s**; shapes 64 B
+  ×1030 / 60 B ×211 / **40 B empty ×122** / 96 B ×73 / 104 B ×48 / 88 B ×57 /
+  76 B ×36 / 80 B ×11 / 100 B ×8. Burst structure: 972 bursts, median **1 report
+  per burst**, interval median **32.7 ms** (~31/s singles; multi-report bursts with
+  0.3-ms in-burst gaps also occur; 76/972 led by an empty). The 2026-10-26
+  "8.78 bursts/s × ~3.2 reports" record was the **long-session** regime — both
+  stand, regime-qualified. Empty reports are **burst-correlated with fragments**
+  (median 0.030 s after a fragment), concentrated at bootstrap (first shapes:
+  40,40,76,76,76,40 …).
+- Device heartbeats: 39 to the phone port at 1.641 s median, seq continuing 29..35+.
+
+### B. Session B — our report-mode client under simultaneous RF monitoring (H-1 decider)
+
+`report_mode.py 0.037` (27/s reports, app-exact bootstrap) on `wlan0` while `mon1`
+captured the air (43.9 s, lossless). Results:
+
+- Client: 15 frames complete in a 1.0-s span = **14.90 fps intra-burst** (burst gaps
+  median 69 ms) — the device CAN push near-app fps at us — then the halt. 398 acks,
+  0 malformed, keepalive/heartbeat as configured.
+- **RF ground truth: the halt is device-side.** Fragments flow +0.20..+1.20 s after
+  bootstrap (335 datagrams, fid 1..15 complete, max gap 115 ms, 30 retransmit dups)
+  — then **zero fragments at the air interface for ~41 s** while our client kept
+  reporting at 27/s and device heartbeats continued at 1.6 s. The client received
+  essentially every transmitted fragment (no host-side loss, no power-save effect,
+  no driver issue — all ruled out in one experiment).
+- Variant probe (completion-correlated empty reports + bootstrap burst; probe script
+  archived): **2 frames — no unlock**. The app's empty reports are a symptom of its
+  engine, not the unlock.
+- H-2 (client power-save) deprioritized the same day: the shipped app holds **no
+  Wi-Fi lock** (0× `createWifiLock`/`WifiLock`/`WIFI_MODE_*` in classes{,2,3}.dex;
+  only 1× WifiManager + CPU WakeLocks) — the phone streams 16.7 fps under default
+  Android Wi-Fi power management (§9.9 G item 6).
+
+### Status and next lever
+
+H-1 narrows to: **what report-stream property keeps the device's TX path open?**
+Everything client-side is excluded; report cadence 26–63 Hz, byte-exact constants,
+2-record variants, app-exact bootstrap, and completion-correlated empties are all
+falsified as sole unlock. The one structural difference left is the app's **report
+state machine**: it mixes record shapes (16/20/24-B records, 1..3 per report, states
+1/0/3, partial bitmasks — §9.5 table) as reassembly evolves, whereas our client sends
+uniform 64-B state=1-full-mask reports. Plan: derive the per-report state machine
+offline from this tape (report sequence vs fragment arrivals), replay live in one
+short session, gate round 3 validates.

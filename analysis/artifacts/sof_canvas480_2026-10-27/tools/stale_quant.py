@@ -1,4 +1,5 @@
 #!/home/stefan/reveng/SL_ylz/.venv/bin/python
+# SUPERSEDED 2026-10-27: parses the retracted d[67:] frag0 layout (FRAG0=67, adversarial-gate round 0); every band/warning number THIS script produced is an artifact of that slice — see ../frag0_layout_2026-10-27/ and doc-04 §9.9 D.
 """Quantify the top-left stale band per complete tape frame:
 - per-row-band mean color & interior distance
 - compare band palette to frame's own interior vs other frames' snippets

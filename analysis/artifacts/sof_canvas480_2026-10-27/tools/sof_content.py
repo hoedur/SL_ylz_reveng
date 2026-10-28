@@ -1,4 +1,5 @@
 #!/home/stefan/reveng/SL_ylz/.venv/bin/python
+# SUPERSEDED 2026-10-27: parses the retracted d[67:] frag0 layout (FRAG0=67, adversarial-gate round 0); every band/warning number THIS script produced is an artifact of that slice — see ../frag0_layout_2026-10-27/ and doc-04 §9.9 D.
 """Content of the 480-canvas decode: top-360 equality + bottom rows + row-wise stats."""
 import struct, subprocess, tempfile, os, sys, io
 sys.path.insert(0, "/home/stefan/reveng/SL_ylz/prototype/src")

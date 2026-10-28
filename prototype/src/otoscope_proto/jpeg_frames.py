@@ -101,9 +101,11 @@ JPEG_HEADER_TABLE = JpegHeaderTable(load_heads())
 
 #: Byte offset of the SOF0 height field inside the template heads (REQ-BOL-010).
 #: Head layout: ``FF D8 | FF DB … | FF C0 00 11 08 <h:2> <w:2> 03 …`` with SOF0 at
-#: 141..149; height (big-endian) at 145..147, width (big-endian) at 147..149.
+#: 140..148 (`FF C0` at 140..141); height (big-endian) at 145..147, width (big-endian)
+#: at 147..149.
 #: All six template heads declare 640×360 there; the native decoder patches these
-#: two fields per frame from the wire's announced w/h (helper @0x26c8-0x26e4).
+#: two fields per frame from the wire's announced w/h (write sites @0x26dc/@0x26e4
+#: of the helper @0x2640 — addr corr. 2026-10-28 gate round 1).
 SOF0_HEIGHT_OFF = 145
 
 #: Big-endian width field offset (REQ-BOL-010); ``SOF0_WIDTH_OFF`` = height + 2.
