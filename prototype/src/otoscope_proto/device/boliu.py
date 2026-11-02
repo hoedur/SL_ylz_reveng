@@ -79,6 +79,14 @@ class BoliUTransport(DeviceTransport):
     FRAG_HDR = 56  # every fragment's header length (REQ-BOL-004, wire-exact)
     FRAG0_TAIL = 11  # frag0-only trailing ASCII metadata, d[len-11:len] (amended REQ-BOL-004
     HEARTBEAT_LEN = 16  # REQ-BOL-003
+    # REQ-BOL-005 amendment 2026-10-29 (doc-04 §9.12): app-parity completion
+    # (last-page arrival + supersession, holes zero-filled). False in the base
+    # ping-mode transport (strict all-pages; its tapes complete cleanly);
+    # True in BoliUReportTransport — the device's flow control follows the
+    # reported fid, which freezes under the strict rule when RF page losses
+    # (invisible 802.11 FCS drops, ~4.4 pages/frame on tape #2) make an
+    # all-pages completion impossible.
+    _APP_PARITY_COMPLETION = False
 
     def __init__(
         self,
@@ -98,6 +106,7 @@ class BoliUTransport(DeviceTransport):
         self._pending: OrderedDict[tuple[int, int], _PendingFrame] = OrderedDict()
         self._last_head: bytes | None = None  # amended REQ-BOL-005/006: sticky
         self._last_completed_frame_id = 0  # most recent fully reassembled frame
+        self._newest_fid = 0  # REQ-BOL-005 amendment: newest frame id seen (supersession)
 
     # -- lifecycle (REQ-ARCH-004) ------------------------------------------
 
@@ -324,26 +333,75 @@ class BoliUTransport(DeviceTransport):
         key = (frame_id, size)
         entry = self._pending.get(key)
         if entry is None:
+            if self._APP_PARITY_COMPLETION and frame_id <= self._newest_fid:
+                # REQ-BOL-005 amendment 2026-10-29: a fragment of an already
+                # superseded/delivered frame arrives late — the native engine
+                # drops it (ring slot no longer active for that fid).
+                self._add_event(
+                    "frame_dropped",
+                    "",
+                    0,
+                    {"stale_fragment": True, "frame_id": frame_id},
+                )
+                return
             while len(self._pending) >= self.MAX_PENDING_KEYS:
+                oldest = next(iter(self._pending))
                 self._pending.popitem(last=False)  # prune oldest key
-                self._add_event("frame_dropped", "", 0, {"pruned": True})
+                if self._APP_PARITY_COMPLETION:
+                    # app parity: a pruned elder is delivered (zero-filled),
+                    # not dropped — the reported fid must keep advancing
+                    self._deliver(oldest, superseded=True)
+                else:
+                    self._add_event("frame_dropped", "", 0, {"pruned": True})
             entry = _PendingFrame(cnt, w, h, q)
             self._pending[key] = entry
+            self._newest_fid = max(self._newest_fid, frame_id)
+            if self._APP_PARITY_COMPLETION:
+                # REQ-BOL-005 amendment 2026-10-29 (doc-04 §9.12): the native
+                # 4-slot ring keyed (fid-1)&3 recycles a slot when frame fid+4
+                # opens — the elder frame is report-delivered then (tape: fid 4
+                # state1 fired exactly when fid 8 started). Deliver pending
+                # frames whose slot gets recycled now; the report fid keeps
+                # advancing (H-1 fix).
+                for k in [k for k in self._pending if k[0] <= frame_id - 4]:
+                    self._deliver(k, superseded=True)
         entry.pages[idx] = page
+        if self._APP_PARITY_COMPLETION:
+            # REQ-BOL-005 amendment 2026-10-29: the frame completes when its
+            # LAST page (idx == cnt-1) arrives — middle holes permitted and
+            # zero-filled (the app displays such frames; only ~32/940 app-tape
+            # frames are ever strictly complete at RF). Ping-mode transports
+            # keep the strict all-pages rule (their tapes complete cleanly).
+            if idx != cnt - 1:
+                return
+            self._deliver(key)
+            return
         if len(entry.pages) < entry.cnt:
             return
-        payload = b"".join(entry.pages[i] for i in range(entry.cnt))
+        self._deliver(key)
+
+    def _deliver(self, key: tuple[int, int], superseded: bool = False) -> None:
+        """Assemble + push a frame and emit ``frame_complete`` (REQ-BOL-005).
+
+        App-parity transports zero-fill missing pages (the native decoder
+        serves stale ring-buffer content for them; ours are visibly neutral).
+        """
+        entry = self._pending.pop(key)
+        frame_id, size = key
+        payload = b"".join(
+            entry.pages.get(i, b"\x00" * self._expected_page_len(i, entry.cnt, size))
+            for i in range(entry.cnt)
+        )
         # Amended REQ-BOL-005/006: pick the head matching the announced
         # quality byte (low byte of q). Unknown level -> sticky previous head
         # (initial DEFAULT_HEADER), like the native handle_mcu_msg_frag path.
-        head = JPEG_HEADER_TABLE.header_for(q & 0xFF)
+        head = JPEG_HEADER_TABLE.header_for(entry.q & 0xFF)
         if head is None:
             head = self._last_head or DEFAULT_HEADER
         else:
             self._last_head = head
         jpeg = assemble_jpeg(head, payload, width=entry.w, height=entry.h)
         self._last_completed_frame_id = frame_id
-        del self._pending[key]
         # push first (network thread, REQ-ARCH-005), then the completion event
         self.store.push_frame(jpeg, time.monotonic())
         self._add_event(
@@ -353,10 +411,11 @@ class BoliUTransport(DeviceTransport):
             {
                 "frame_id": frame_id,
                 "size": size,
-                "cnt": cnt,
-                "w": w,
-                "h": h,
-                "q": q,
+                "cnt": entry.cnt,
+                "w": entry.w,
+                "h": entry.h,
+                "q": entry.q,
+                **({"superseded": True} if superseded else {}),
             },
         )
 
@@ -401,13 +460,19 @@ class BoliUReportTransport(BoliUTransport):
     further pings are ever sent** (a continuous ping loop caps delivery at
     ≈3.7 fps, live-falsified); the steady state sends to ``host:port``:
 
-    - receive-progress report every ``report_interval`` s (default 0.038 ≈ the
-      app's sustained ~26.4 reports/s): ``EF 02 40 00`` + magic ``02 02 00 01``,
+    - receive-progress report every ``report_interval`` s (default 0.025 = the
+      native 25-ms pacer, doc-04 §9.12): ``EF 02 40 00`` + magic ``02 02 00 01``,
       record count 1, constant ``0A 4B 14 2D`` at datagram offset 24, ``fid``
       LE32 (most recently completed frame), state 1, record size ``0x18`` and
       the FF×8 fragment bitmask; 64 B total (``len16`` counts the whole
       datagram). Reports stay silent until the first frame completes
-      (fid-0 reports poison the stream — live-verified).
+      (fid-0 reports poison the stream — live-verified). While a newer frame
+      is in flight the report becomes the app's two-record shape (80 B, REQ-BOL-008
+      amendment 2026-10-29): record 2 = (in-flight fid, state 3, recSize 16).
+    - **H-1 fix (2026-10-29)**: this transport uses app-parity completion
+      (frames complete on last-page arrival or supersession, holes zero-filled)
+      so the reported fid never freezes — the device halts streaming when the
+      client's fid stalls (H-1 root cause, doc-04 §9.12).
     - stream keepalive every 1.64 s: ``EF 08 08 00`` + LE32 counter tracking
       the device heartbeat ``seq`` (the heartbeat mirrors stream age).
 
@@ -416,11 +481,18 @@ class BoliUReportTransport(BoliUTransport):
 
     name = "boliu-report"
 
-    REPORT_INTERVAL_S = 0.038  # REQ-BOL-008 (≈ app's 26.4 reports/s, lossless capture)
+    # REQ-BOL-008 amendment 2026-10-29: default 0.025 s — the native pacer
+    # (thread_timer sends build_send_ack when >=25 ms elapsed; libbl_vii_jni.so
+    # disasm, doc-04 §9.12) and tape-#2 median report gap 24.9 ms. The earlier
+    # 0.038 default (≈26.4/s) predated the pacer discovery.
+    REPORT_INTERVAL_S = 0.025
     KEEPALIVE_INTERVAL_S = 1.64  # REQ-BOL-008 (device heartbeat cadence)
     REPORT_BODY_CONST = bytes.fromhex("0A4B142D")
     REPORT_MAGIC = bytes.fromhex("02020001")
     BOOTSTRAP_PING_GAP_S = 0.10  # REQ-BOL-009 (app: 2nd ping +0.10 s after the 1st)
+    # REQ-BOL-005 amendment 2026-10-29: app-parity completion (last-page arrival
+    # + supersession, holes zero-filled) — H-1 fix; see class docstring.
+    _APP_PARITY_COMPLETION = True
 
     def __init__(
         self,
@@ -493,6 +565,32 @@ class BoliUReportTransport(BoliUTransport):
     def build_keepalive(self, seq: int) -> bytes:
         """8 B ``EF 08 08 00`` stream keepalive (REQ-BOL-008)."""
         return b"\xEF\x08\x08\x00" + struct.pack("<I", seq & 0xFFFFFFFF)
+
+    def build_two_record_report(self, fid: int, inflight_fid: int) -> bytes:
+        """80 B two-record report (REQ-BOL-008 amendment 2026-10-29).
+
+        The app's steady-state shape while a newer frame is in flight (tape #2:
+        rec1 = completed fid, state 1, full mask; rec2 = in-flight fid, state 3,
+        recSize 16 — no mask field; 32 hdr + 24 + 16 + 8 trailer = 80 B). This
+        is the device's flow-control ticket: it proves the client is current
+        and names the frame it is working on.
+        """
+        d = bytearray(80)
+        d[0:4] = b"\xEF\x02\x50\x00"
+        d[4:8] = self.REPORT_MAGIC
+        struct.pack_into("<I", d, 8, 2)  # two records
+        d[24:28] = self.REPORT_BODY_CONST
+        # record 1: completed frame (state 1, recSize 0x18, full FF×8 mask)
+        struct.pack_into("<I", d, 32, fid & 0xFFFFFFFF)
+        struct.pack_into("<I", d, 40, 1)
+        struct.pack_into("<I", d, 44, 0x18)
+        d[48:56] = b"\xFF" * 8
+        # record 2: in-flight frame (state 3, recSize 0x10, no mask)
+        struct.pack_into("<I", d, 56, inflight_fid & 0xFFFFFFFF)
+        struct.pack_into("<I", d, 64, 3)
+        struct.pack_into("<I", d, 68, 0x10)
+        # d[72:80] zero trailer stays 0
+        return bytes(d)
 
     # -- worker threads -----------------------------------------------------
 
@@ -567,13 +665,25 @@ class BoliUReportTransport(BoliUTransport):
                 # delivery entirely — falsified fid-0 reports poison the stream.
                 # Stay silent until the first real completion.
                 continue
-            payload = self.build_report(fid)
+            # REQ-BOL-008 amendment 2026-10-29 (H-1 fix, doc-04 §9.12): while a
+            # newer frame is in flight, append the app's second record
+            # (in-flight fid, state 3, recSize 16) — the flow-control ticket
+            # that keeps the device streaming. rec1 keeps advancing thanks to
+            # app-parity completion (last-page/supersession), so the device
+            # never sees a stuck client.
+            inflight = max((k[0] for k in self._pending), default=0)
+            if inflight > fid:
+                payload = self.build_two_record_report(fid, inflight)
+                fields: dict[str, Any] = {"fid": fid, "inflight": inflight}
+            else:
+                payload = self.build_report(fid)
+                fields = {"fid": fid}
             try:
                 sock.sendto(payload, (self.host, self.port))
             except OSError:
                 return
             self._add_event("report_ack", f"{self.host}:{self.port}", len(payload),
-                            {"fid": fid}, payload)
+                            fields, payload)
 
     def _keepalive_loop(self) -> None:
         while not self._stop_flag.is_set():

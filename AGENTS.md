@@ -61,7 +61,12 @@ empirical from `analysis/04-live-device-validation.md` + `analysis/artifacts/`.
     payload is **not** validated — any single datagram to 8800 re-arms/redirects the stream;
     retraction: sustained delivery is NOT guaranteed by arbitrary datagrams — report-mode
     sessions open but then halt 0.3–0.7 s in, EXP3 replayed the app's own bytes and still
-    halted — doc-04 §9.9 C).
+    halted — doc-04 §9.9 C). **Scope correction (doc-04 §9.13, 2026-10-29): the ~101-ms TTL
+    applies to ping-only sessions only. In the app's bootstrap-established report session the
+    device streams on its own encoder clock — NOT ping-pong, NOT datagram-armed: tape-verified
+    823 ms of total client silence with full-rate fragment flow (511/s), 118 gaps >101 ms
+    carrying 392 frame starts; the gate is claim-CONSISTENCY (silence and count-0 empties
+    harmless; fid-0/stale-fid claims halt the stream).**
   - Device streams fragments from `:1234`: `[0x93][01][len LE16]` + 56-byte header on **every**
     fragment (amended 2026-10-27 gate-1: frag0 carries 11 TRAILING ASCII bytes
     `d[len-11:len]`, e.g. `-0214,-0894`; page0 = `d[56:len-11]`; the "67-byte frag0 header"
@@ -102,19 +107,20 @@ empirical from `analysis/04-live-device-validation.md` + `analysis/artifacts/`.
     mirrors that counter; resets to 1 per session; per-session fid counter also starts at 1).
     Report record = `fid u64 | state u32 (1=complete,0=in-flight,3=not-running) | recSize u32
     (0x18=24 B w/ u64 mask, 0x14=20 B w/ u32 mask, 0x10=16 B no mask)`; 8-B zero tail.
-    **H-1 (RF-decided 2026-10-28): DEVICE-side** — every report-mode client variant
-    (26/39/63 Hz, const@24 byte-exact, 2-record, app-exact bootstrap,
-    completion-correlated empties) halts fragment delivery ~0.3–1.2 s in while heartbeats
-    continue; simultaneous monitor capture shows the device stops sending at the air
-    interface for 41 s (client loss/power-save/driver excluded in one experiment; the
-    app holds no Wi-Fi lock — static DEX evidence). Our intra-burst rate reaches
-    14.9 fps, so the pipe is there; the missing condition is a property of the app's
-    report stream — last untested lever: its mixed-shape report state machine
-    (doc 04 §9.11). The app's own reports sustain 16 fps for minutes.
+    **H-1 ROOT-CAUSED 2026-10-29 (doc 04 §9.12): the device's flow control follows the
+    client's report fid — our strict all-pages reassembly freezes rec1 at the first frame
+    with an RF-lost page (~4.4 pages/frame lost to invisible 802.11 FCS errors; only 32/940
+    app-tape frames are ever complete), and the device stops streaming when the reported
+    fid stalls (41 s RF silence in the monitored halt). The app completes frames on
+    last-page arrival or supersession (holes allowed, JPEG decoder tolerates gaps — the
+    source of its own occasional color shifts), reports rec1=(delivered fid, state 1, full
+    mask) + rec2=(in-flight fid, state 3, rs 16), paced ≥25 ms (disasm of build_send_ack/
+    thread_timer; page-0 never tested by the completion scan; 2-s stall → full reset).**
+    Fix = app-parity delivery + report engine v2 in the prototype.
   - **App-exact bootstrap = 2× ping + 2× empty report (IE doc 04 §9.6 A, tape-verified):** the
     device's first video fragment arrives +0.10 s after the first ping; first record report
     +0.21 s (fid=2). Prototype implementation: `BoliUReportTransport` (REQ-BOL-008/009,
-    suite 87/87 at introduction — 98/98 current) — live fps still capped ~4 fps (H-1 open).
+    suite 87/87 at introduction — 102/102 current) — live fps still capped ~4 fps (H-1 open).
   - Interface note (2026-10-26 evening): this boot's radio interface is **`wlan1`** (the
     earlier udev/iwd rename to `wlan0` was session-specific — check `iwctl device list` first).
     Per-frame last page is a short datagram (remainder + 56 B header) — expected by
@@ -156,11 +162,13 @@ empirical from `analysis/04-live-device-validation.md` + `analysis/artifacts/`.
     all 78 268 fragments of all taped sessions clean). **Corrections (§9.8)**:
     (1) the wire raster is **640×480** — "bogus 480" was wrong; the native helper patches
     the head copy's SOF0 dims per frame from d[44]/d[46] (@0x26dc/0x26e4, head+145/147);
-    the prototype does the same now (REQ-BOL-010, suite 98/98), otherwise the bottom 120
+    the prototype does the same now (REQ-BOL-010, suite 102/102), otherwise the bottom 120
     rows were silently clipped; (2) the native completion scan never tests page-0's mask
     bit and recycles ring slots (fid−4) without clearing buffers — the *app* accepts
-    page0-loss frames with stale slot content; the prototype drops them instead (deliberate
-    divergence; suite 98/98 current); (3) **the user's left/top stripes were OUR OWN slicing bug** — the
+    page0-loss frames with stale slot content; the prototype dropped them (deliberate
+    divergence, suite 98/98) until 2026-10-29, when the report-mode transport adopted
+    app-parity completion as the H-1 fix (REQ-BOL-005 amendment; suite 102/102 current);
+    (3) **the user's left/top stripes were OUR OWN slicing bug** — the
     "device-side foreign content" attribution (7/10 tape frames, foreign-palette band) and
     its later "device-side top-row pipeline" refinement were both artifacts of the wrong
     `d[67:]` slice; under the wire-exact slice all 10 tape frames decode clean and every
@@ -213,7 +221,7 @@ empirical from `analysis/04-live-device-validation.md` + `analysis/artifacts/`.
 - **Validation prototype** (user-authorized implementation, not production): `prototype/`
   — PyQt6 client with spec-first TDD (`prototype/docs/ARCHITECTURE.md` is binding; no code
   without a REQ id). Tests: `cd prototype && QT_QPA_PLATFORM=offscreen
-  /home/stefan/reveng/SL_ylz/.venv/bin/python -m pytest tests/ -q` (98 passing). App runs
+  /home/stefan/reveng/SL_ylz/.venv/bin/python -m pytest tests/ -q` (102 passing). App runs
   need `PYTHONPATH=src`. The six `data/jhdr_Q{5,10,25,50,75,100}.bin` heads (605 B) are the
   per-frame decode recipe of §10b.6; prior "Q100 always" test expectations are superseded.
 

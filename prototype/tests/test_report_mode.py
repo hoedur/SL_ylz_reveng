@@ -379,11 +379,12 @@ def test_completed_frame_still_reaches_store_with_q_head(h):
     assert len(f) == 605 + 2100 + 2
 
 
-def test_default_report_interval_matches_app_rate():
-    # 0.038 s ≈ the original app's sustained ~26.4 reports/s (lossless capture)
-    assert BoliUReportTransport.REPORT_INTERVAL_S == pytest.approx(0.038)
+def test_default_report_interval_matches_native_pacer():
+    # REQ-BOL-008 amendment 2026-10-29: 0.025 s = the native 25-ms report pacer
+    # (thread_timer disasm, doc-04 §9.12); tape-#2 median report gap 24.9 ms.
+    assert BoliUReportTransport.REPORT_INTERVAL_S == pytest.approx(0.025)
     t = BoliUReportTransport("127.0.0.1", 1, TelemetryStore("boliu"))
-    assert t._report_interval == pytest.approx(0.038)
+    assert t._report_interval == pytest.approx(0.025)
     assert t._keepalive_interval == pytest.approx(1.64)
     # REQ-BOL-009
     assert t.BOOTSTRAP_PING_GAP_S == pytest.approx(0.10)
@@ -393,3 +394,84 @@ def test_default_report_interval_matches_app_rate():
 def test_base_transport_unchanged_signature():
     t = BoliUTransport("127.0.0.1", 1, TelemetryStore("boliu"))
     assert t.PING_PAYLOAD == bytes.fromhex("EF000400")
+
+
+# --- REQ-BOL-005/008 amendment 2026-10-29: app-parity completion + report v2 ---
+
+
+def test_holey_frame_completes_on_last_page(h):
+    """App parity (doc-04 §9.12): a frame with a missing MIDDLE page completes
+    when its last page (idx == cnt-1) arrives; the hole is zero-filled."""
+    size = 2100
+    h.send(fragment(6, 0, 3, size, mkpage(1, 1024)))
+    h.send(fragment(6, 2, 3, size, mkpage(3, size - 2048)))  # page 1 never sent
+    ev = h.col.wait_for(
+        "frame_complete for holey frame 6",
+        lambda e: e.kind == "frame_complete" and e.fields.get("frame_id") == 6,
+        timeout=5.0,
+    )
+    got = h.store.pop_frame()
+    assert got, "holey frame must still be pushed (app displays holey frames)"
+    f, _ = got
+    assert len(f) == 605 + size + 2  # zero-filled hole keeps the layout
+    # the hole is zeros: page 1 region within the payload
+    payload = f[605:-2]
+    hole = payload[1024:2048]
+    assert hole == b"\x00" * 1024
+    assert ev.fields["cnt"] == 3
+
+
+def test_supersession_delivers_older_frame(h):
+    """Native ring parity (doc-04 §9.12): a pending elder is delivered when the
+    ring slot is recycled — when frame fid+4 opens (tape: fid 4's state1 fired
+    exactly when fid 8 started). The report fid keeps advancing (H-1 fix)."""
+    h.send(fragment(6, 0, 3, 2100, mkpage(1, 1024)))  # frame 6: frag0 only
+    h.complete_frame(frame_id=7)  # 7, 8, 9 use the other slots
+    h.complete_frame(frame_id=8)
+    h.complete_frame(frame_id=9)
+    h.send(fragment(10, 0, 3, 2100, mkpage(1, 1024)))  # recycles frame 6's slot
+    ev = h.col.wait_for(
+        "frame 6 delivered via slot recycle",
+        lambda e: e.kind == "frame_complete" and e.fields.get("frame_id") == 6,
+        timeout=5.0,
+    )
+    assert ev.fields.get("superseded") is True
+
+
+def test_two_record_report_carries_inflight_record(h):
+    """While a newer frame is in flight, the report is the app's 80-B two-record
+    shape: rec1 (completed fid, state 1, full mask) + rec2 (in-flight fid,
+    state 3, recSize 16) — the device's flow-control ticket (doc-04 §9.12)."""
+    h.complete_frame(frame_id=2)
+    h.col.wait_for("report fid 2", lambda e: e.kind == "report_ack"
+                   and e.fields.get("fid") == 2, timeout=5.0)
+    h.send(fragment(3, 0, 3, 2100, mkpage(1, 1024)))  # frame 3 opens, never finishes
+    got = h.col.wait_for(
+        "two-record report",
+        lambda e: e.kind == "report_ack" and e.fields.get("inflight") == 3,
+        timeout=5.0,
+    )
+    d = bytes.fromhex(got.raw_hex)
+    assert len(d) == 80 and d[:4] == b"\xEF\x02\x50\x00"
+    assert struct.unpack_from("<I", d, 8)[0] == 2  # record count
+    assert struct.unpack_from("<I", d, 32)[0] == 2  # rec1 fid
+    assert struct.unpack_from("<I", d, 40)[0] == 1  # state complete
+    assert struct.unpack_from("<I", d, 44)[0] == 0x18
+    assert d[48:56] == b"\xFF" * 8
+    assert struct.unpack_from("<I", d, 56)[0] == 3  # rec2 fid = in-flight
+    assert struct.unpack_from("<I", d, 64)[0] == 3  # state 3
+    assert struct.unpack_from("<I", d, 68)[0] == 0x10  # recSize 16
+
+
+def test_late_fragment_of_delivered_frame_dropped(h):
+    """Native parity: fragments of an already-delivered frame are dropped (the
+    ring slot moved on) — no re-push churn, fid bookkeeping stays monotonic."""
+    h.complete_frame(frame_id=4)
+    h.col.wait_for("frame 4 complete", lambda e: e.kind == "frame_complete"
+                   and e.fields.get("frame_id") == 4, timeout=5.0)
+    before = len(h.col.by_kind("frame_complete"))
+    h.send(fragment(4, 1, 3, 2100, mkpage(2, 1024)))  # late retransmit
+    h.col.settle(0.3)
+    assert len(h.col.by_kind("frame_complete")) == before
+    drops = [e for e in h.col.by_kind("frame_dropped") if e.fields.get("stale_fragment")]
+    assert drops and drops[-1].fields["frame_id"] == 4

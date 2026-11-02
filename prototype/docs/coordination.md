@@ -439,3 +439,32 @@ record in doc-04 §9.11. Two sessions, same boot:
   16/20/24 B, 1..3 records, states 1/0/3, partial bitmasks at reassembly moments) offline
   from tape #2, replay live, then gate round 3. No spec/code change in this entry
   (live-probe tooling only); REQ-BOL-008 note updated with the RF result.
+
+## Amendment 2026-10-29 — H-1 ROOT CAUSE + app-parity delivery/report engine (REQ-BOL-005/008 amended)
+
+Ground truth from three independent sources (doc-04 §9.12): the disassembly of
+`libbl_vii_jni.so` (26 KB, fully mapped: `build_send_ack`, `thread_timer`, `thread_ctl`,
+`handle_mcu_msg_frag`), the tape-#2 report/reassembly correlation, and prior art
+(haxko/NE3-Scope implements the same 25-ms engine). Findings:
+
+1. **Completion (REQ-BOL-005 amended):** the app completes a frame when its **last page
+   (idx == cnt−1) arrives** — middle holes permitted — or when a **newer frame supersedes**
+   it; the native completion scan tests mask bits 1..cnt−1 only (**page 0 never tested**).
+   Only 32/940 app-tape frames are ever strictly complete (~4.4 pages/frame lost to
+   invisible 802.11 FCS errors); the app reports 623 fids complete with all-ones masks and
+   displays them. The prototype's strict all-pages completion (deliberate divergence,
+   gate round 2) is what froze our report fid and triggered the device halt — it becomes
+   app-parity.
+2. **Report engine (REQ-BOL-008 amended):** paced ≥25 ms (thread_timer 1-ms tick);
+   rec1 = (delivered fid, state 1, FULL mask — always, holes notwithstanding);
+   rec2 = (in-flight fid, state 3, recSize 16, no mask) while a frame is in progress;
+   count=0 empty when neither exists; const `0a 4b 14 2d` = quality bytes (10,75,20,45)
+   initialized by the 2-s reset path; pings every ≥101 ms when no fragments flow;
+   full state reset after 2 s without fragments.
+3. Chip research: "BL384" is a vendor project label (not a Bouffalo part number);
+   candidates BL616/618 (~40 %) / BL602/604 (~30 %); no public vendor SDK; NE3-Scope
+   parses the frag0 11-B tail as signed x/y (sensor channel corroboration).
+- Implementation (this amendment): `_handle_fragment` completes on last-page arrival +
+  supersession tracking; `BoliUReportTransport` report engine v2 (rec1+rec2, ≥25 ms
+  pacer, empty fallback). Hole-tolerant push means occasional decoder artifacts on
+  holey frames — app parity (the app shows the same class of artifacts).

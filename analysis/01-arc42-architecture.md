@@ -509,7 +509,7 @@ Two validated refutations change the record (full evidence: doc-04 §9.8):
    from the announced w/h (write sites @0x26dc/0x26e4 → head+145 = BE16 height,
    head+147 = BE16 width; call-site stash @0x240c/0x2414). Empirically w=640, h=480 on
    **1 061/1 061** frag0 datagrams of both lossless app tapes. The prototype now does the
-   same (REQ-BOL-010, suite 96/96 at that round; 98/98 current after the 2026-10-28
+   same (REQ-BOL-010, suite 96/96 at that round; 102/102 current after the 2026-10-29
    short-last-page fix). The former "extraneous bytes before marker 0xd9"
    quirk is **explained and benign**: trailing entropy = the bottom 120 raster rows a
    360-canvas head cannot consume *(the small residual numbers — "fid 2080: 8 374 → 3
@@ -535,8 +535,8 @@ Two validated refutations change the record (full evidence: doc-04 §9.8):
    page0 = `d[56:len-11]` (§10b.4 field map amended accordingly); helper base =
    caller slot **+0x80** (earlier docs said "minus 0x80" — inverted); fragment header is
    56 B for every fragment; recon/patch write sites unchanged. Prototype amended
-   spec-first (REQ-BOL-004, coordination entry); suite 96/96 at that round (98/98
-   current); the djpeg-clean 10/10
+   spec-first (REQ-BOL-004, coordination entry); suite 96/96 at that round (102/102
+   current after the 2026-10-29 H-1 fix); the djpeg-clean 10/10
    verification is the acceptance evidence.
 
 ---

@@ -1052,3 +1052,111 @@ state machine**: it mixes record shapes (16/20/24-B records, 1..3 per report, st
 uniform 64-B state=1-full-mask reports. Plan: derive the per-report state machine
 offline from this tape (report sequence vs fragment arrivals), replay live in one
 short session, gate round 3 validates.
+
+## 9.12 The client engine, ground truth: libbl_vii_jni.so disassembly + report-state-machine derivation (2026-10-29)
+
+H-1 root cause found (H2 chip research + report-engine derivation + .so disassembly + prior art).
+Artifacts: `/tmp/opencode/rsm/` (derivation scripts), `/tmp/opencode/research_{chip,sdk,hnd}/verdict.md`;
+full number set below.
+
+### A. Report engine (wire + disasm)
+
+`build_send_ack` @0x275d builds one EF-02 datagram per call: walks 4 small slot records
+(instance+0x80, stride 0xb0), emits per-slot records — `fid` u64, state ∈ {1,0,2,3,-1},
+**recSize = 16 + 4·⌈maskbits/32⌉** (⇒ the 16/20/24 shapes), mask copied from the slot;
+appends the **saved in-flight record** (instance+48, len at +36, present-flag +32); writes
+the const `0a 4b 14 2d` from instance+84..87 to offset 24 (thread_timer's reset path
+initializes those bytes to **10, 75, 20, 45** — the quality LUT values!); count @8; len @2;
+`sendto` :8800. Callers: **thread_timer @0x1ae9** = 1-ms tick loop: ping `EF 00 04 00`
+every **≥101 ms** while no fragments flow; **report every ≥25 ms** while stream-active;
+1-s toggle byte; **2 s without fragments → full state reset** (zero everything, re-init
+the const bytes). thread_ctl @0x1db5 drains a small queue into the saved record
+(event-driven report content). The tape corroborates: report gaps median 24.9 ms,
+59 % of reports within 5 ms of a fragment (event content, timer-paced).
+
+### B. Reassembly + completion (disasm, `handle_mcu_msg_frag` @0x230d)
+
+4-slot ring keyed **(fid−1) mod 4** (slot init when `slot.fid == fid−4` or fresh);
+per-slot: fid@136, cnt@144, size@148, w@156, h@158, q@160, state@128 ∈ {0,1,2,3,4,5},
+**mask@164 (bit set = page received)**; page bytes at slot+292. Completion scan: **all
+mask bits 1..cnt−1 set — page 0 (idx 0) is NEVER tested** (§9.8's caveat, now
+disasm-exact). Completed → state 2 → frame queued (fid, size, q, w/h, pages) → state 3.
+
+### C. The report fid is NOT the strict reassembly state — and that's the point
+
+Tape #2: only 32/940 frames ever receive ALL declared pages at RF — **~4.4 pages/frame
+are silently lost to 802.11 FCS errors** (invisible to monitor captures; 281 dup pages =
+device retransmits), yet the app reports **623 distinct fids as state=1 with ALL-ONES
+masks** (1602/1602 full) at 16.66 fps and displays them. state1 delay after the frame's
+last page: median 38 ms (report pacer); rec1 advances ~1 per frame with steps {1: 742,
+2: 80, 0: 58, 3: 9}; rec2 = (in-flight fid, state 3, rs 16, no mask) while a frame is in
+progress; 122 empties (count=0); state=0 (rs 24, real partial mask = retransmit request)
+only 64×. A strict-native simulation (bits 1..cnt−1) completes only 78 frames — the
+app's report bookkeeping is deliberately permissive: **frames are delivered on last-page
+arrival or supersession, holes and all** — the JPEG decoder tolerates the gaps (this is
+also where the app's own occasional color-shift artifacts come from).
+
+### D. H-1 root cause (working theory, high confidence)
+
+The device's flow control follows the client's report fid. Our report-mode client emits
+rec1 = (last STRICTLY-complete frame, state 1) — with FCS page losses the strict
+completion stalls (Session B: frozen at fid 15) — the device sees a client stuck frames
+behind and stops streaming (41 s RF silence). The app never freezes: rec1 advances every
+frame (holes allowed), plus the in-flight state3 record tells the device the client is
+alive and current. All previous H-1 variants failed because they replicated report
+SHAPE/CADENCE but kept the strict completion → fid freeze.
+
+### E. Chip research (secondary)
+
+"BL384" is **not a Bouffalo part number** — a vendor project label (Bl384SDK tag).
+OUI F4:42:50 = Bouffalo Lab (Nanjing). Best chip candidates: BL616/618 (~40 %, only
+family with HW MJPEG) or BL602/604 (~30 %); b/g-only soft-AP is a firmware config, not
+a chip limit; DTIM-100 not in the documented SDK API. No public vendor SDK for this
+protocol; prior art: **haxko/NE3-Scope client.py implements the same 25-ms report engine**
+(40-B empty every 25 ms while incomplete, ACK+REQ on completion, ping+reset after 0.5 s
+silence — independently written, matches our disasm); NE3 parses the frag0 11-B tail as
+**signed x/y + atan2 angle** (sensor channel ✓); HND_Earscope_PC_Client (same vendor
+namespace) is ping-only; the "416×416" in its README is a different unit (NE3 issue #4);
+its embedded Q75 head is byte-identical to ours. Sibling app: Fongool (com.cooingdv.fongool).
+
+## 9.13 Ping-pong hypothesis refuted: the device streams on its own clock (offline re-analysis, 2026-10-29)
+
+Question (user): does the app↔device link work as strict ping-pong — one client datagram
+in, one video frame out? Tested on both phone↔device monitor tapes
+(`app_go.tsv` tape #2 2026-10-28 and `session_start5.tsv` 2026-10-26; derivation scripts
+`/tmp/opencode/rsm/pingpong{,2,3,4}.py`). **Answer: no, in the strongest possible form.**
+
+| Test | Tape #2 (57 s, 941 frames, 1631 client dgs) | session_start5 (29.5 s, 438 frames, 778 dgs) | Ping-pong predicts |
+|---|---|---|---|
+| client dgs : frames | 1.73 : 1 (2 pings + 1596 reports + 33 keepalives) | 1.78 : 1 | 1 : 1 |
+| client dgs between consecutive frame starts | {0: 315, 1: 263, 2: 159, 3: 67, … 17: 1} | {0: 114, 1: 138, 2: 95, 3: 30, … 7: 5} | exactly {1} |
+| frames between consecutive client dgs | {0: 1004, 1: 480, 2: 77, … 14: 1} | (same shape) | exactly {1} |
+| delay last-client-dg → frame start | p10 5 ms / med 33 ms / p90 184 ms / **max 820 ms** | same shape | tight constant latency |
+| client-silence gaps > 101 ms | **118**, containing 392 frame starts + 10 259 fragments | 59, containing 140 frame starts | 0 (delivery must stop) |
+| device-initiated tokens | none: only `93 01` frags + `93 04` heartbeats (the 2× `02 01` are DHCP OFFER/ACK relay) | only `93 01` + `93 04` | a request must exist |
+
+Decisive single observation (tape #2, +12.1 s into the session): **823 ms with zero :8800
+datagrams** while the device streamed 421 fragments (14 frames) at **511 fragments/s —
+above the session average (474/s)** — and the phone was transmitting DNS queries (port 53,
+6×) and app-cloud datagrams (port 19309, 3×) inside the window, proving radio and sniffer
+were healthy (no capture loss can hide 25+ report datagrams while 9 other phone frames
+and 421 device fragments are heard). The app's report thread simply stalled (phone-side
+scheduling); the device did not care. The gap ends with a 64-B single-record report, and
+streaming had never paused.
+
+**Conclusion.** The device streams from its own encoder clock (~16.5 fps, bursty) once the
+session is open. Client datagrams are not per-frame tokens and do not arm delivery — they
+carry **flow-control state** (fid progress claims). The gate is *claim-consistency*, not
+presence: silence is tolerated (≥823 ms observed; empties harmless — the app sends 122
+count-0 reports), while contradictory claims halt the stream (fid-0 reports poison it —
+live-verified 2026-10-26; stale-fid reports halt it — Session B, §9.12 D). The CCF peak at
++52 ms is the aliasing of two free-running periodic trains (60 ms frames vs ~35 ms client
+cadence), not stimulus-response.
+
+Canon refinement (scope correction to §10b.2): the "**delivery stops ~101 ms without
+contact**" rule was established on **ping-only** sessions (ping-serve batch mode). The
+app's report-mode session demonstrably tolerates ≥823 ms of total client silence — the
+101-ms TTL does not apply to a bootstrap-established report session. No prototype change
+needed (the report engine sends every 25 ms anyway); the prototype's silence tolerance
+requirement is thereby relaxed, and the H-1 fix direction (content, not cadence) is
+independently confirmed.
